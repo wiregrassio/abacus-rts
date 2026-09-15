@@ -1,255 +1,187 @@
-# rf-RTOS: kickoff
+# RF-RTS: kickoff
 
-Standalone design doc. Read cold, build from it. A soft-real-time liveness scheduler for
-containers on Jetson — the RTOS-equivalent coordinator that replaces the current 1-second
-heartbeat poll. Not motion control, not hard-real-time, not safety-rated.
+LLM entry point. Read cold, build from it. RF-RTS is the Roboflow Real-Time Scheduler: a
+coordination primitive daemon. It provides one primitive, the interlock, and reaps interlocks
+whose heartbeat expires. Counters and timers are contracts layered over the interlock by the
+client SDK. Not motion control, not hard-real-time, not safety-rated.
 
-Sibling context (optional): `research-rf-rtos.md` (Linux RT facilities deep-dive),
-`brief-alex-norell-roboflow-os.md` (RF OS / deployment-target context).
+The decomposed, Forge-consumable form of this document is `design/`. This file is the single
+narrative; `design/ARCHITECTURE.md` and `design/CONTRACTS.md` are the addressable rung. When they
+drift, design/ is authoritative for structure and this file for intent.
 
----
+## Thesis
 
-## Thesis + contract
+One primitive: the interlock. Three u64 words in shared memory (a memfd), begin, end, heartbeat.
+begin and end are futex-waitable. All three are monotonic, non-negative, incremented by arbitrary
+amounts, never decremented. That is the entire substrate. Everything RF-RTS does is expressed in
+those three numbers.
 
-One busy-loop increments a shared-memory atomic tick counter on an absolute-time schedule.
-Containers `futex_wait` on child counters derived from it. That's the whole system: waitable
-counters + one honest clock.
+The daemon runs a 1 ms best-effort loop. Each cycle it reaps interlocks whose heartbeat TTL has
+expired, and wakes waiters whose watched counter has crossed their target. It hands out interlock
+file descriptors over a Unix domain socket. That is the whole daemon.
 
-- **Contract:** 10 ms tick, 1σ ≈ ±1 ms (±2 ms acceptable; stated claim is ±1 ms).
-- **Referent:** FreeRTOS-on-ESP32 default tick is 1 ms / 1000 Hz. We're matching an RTOS
-  reference tick in userspace on a 12-core A78AE. This is not ambitious.
-- **Baseline it beats:** current liveness is a 1 s heartbeat. Even a 100 ms tick is 10×
-  better. We sit ~2 orders of magnitude inside "good enough for production."
-- **Bar it clears:** tighter than an Allen-Bradley ControlLogix scan-jitter spec. This is a
-  PLC-class problem, not an NSA-timing one. We're checking Docker containers are alive.
-- **Load reality:** ~3–4 tasks executed per tick, work-per-tick sub-1 ms, everything
-  downstream tolerates ≥100 ms. Never a saturated system.
+Counter and timer are not new primitives. They are contracts over the interlock:
 
-The whole hard-real-time rigor in `research-rf-rtos.md` (L4 cache, MPAM, MOESI,
-cross-cluster coherence, 100 µs loops, PREEMPT_RT) is **v2 optimization surface, not needed
-now.** Do not lead with it.
+- Interlock: RF-RTS reaps it when its heartbeat TTL expires. That is the only thing RF-RTS does
+  to a bare interlock. Raw interlock traffic (begin and end advancing, futex waits) happens
+  entirely outside RF-RTS.
+- Counter: an interlock RF-RTS watches. RF-RTS wakes waiters when the counter crosses their
+  target. The owner sets its own TTL and owns what a timeout means.
+- Timer: a counter whose watched interlock is the system clock, with units of milliseconds and a
+  futex timeout that is fatal. RF-RTS sets the timer's TTL from the wait duration.
 
----
+The satisfying part: all coordination on the device reduces to three u64 numbers per interlock,
+two of them futexes, only ever counting up. Time is not special. The system clock is itself an
+interlock whose end counter is the millisecond count; a timer is a counter watching it.
 
-## v0 — the version that ships (do nothing exotic)
+## Daemon versus SDK
 
-A userspace daemon. Rust or Python. No pinning, no SCHED_FIFO, no isolcpus, no kernel
-rebuild required to hold the contract.
+RF-RTS is two things that must not bleed into each other.
+
+The RF-RTS daemon is the systemd binary on its 1 ms loop. It reads heartbeat words, reaps expired
+interlocks, wakes counter-crossers, and hands out interlock fds over UDS (create and attach). It
+knows nothing about consumers, background threads, or what a timer means at the API level. It sees
+only interlocks and heartbeats.
+
+The RF-RTS client SDK is the library a process links. It owns the ergonomics: attach to the daemon
+over UDS, the background touch thread that keeps a heartbeat fresh, the `timer()`, `wait_ms()`, and
+`touch_ms()` calls, the futex-timeout to `RTSTimeout` crash logic, and surfacing `InterlockReaped`.
+The counter and timer contracts are enforced client-side on top of the raw interlock the daemon
+provides.
+
+The rule: the daemon provides interlocks and reaps them; the SDK provides everything that makes an
+interlock feel like a timer or a counter. Consumer-specific behavior is SDK. The shared contract
+(reap on TTL, wake on cross, fd handout) is daemon. Two SDKs ship: Rust (native core) and Python
+(pyo3 binding over the Rust core, so the wait, touch, and crash logic exists once and Python
+inherits it).
+
+## The interface, in full
+
+UDS carries exactly two request types:
+
+- create interlock, returns an fd
+- attach to interlock, returns an fd
+
+That is all. No command and control. Everything else happens through the interlock via futex, not
+through the daemon. RF-RTS hands out handles; it does not take orders.
+
+Daemon behavioral contract, on the 1 ms best-effort loop:
+
+- reap interlocks whose heartbeat TTL has expired
+- wake waiters whose watched counter has crossed their target (a timer is the clock-counter case)
+
+If it is not one of those two behaviors or the two UDS calls, it is not the daemon's concern.
+
+## Contracts and behavior
+
+TTL is monotonic-forward. On a wait or a touch, the new TTL is `max(current, now + duration)`. It
+never decrements. There is no separate wake-target-versus-heartbeat conflict, because the
+heartbeat word and the wake-target are different u64s: setting a wake target does not touch the
+heartbeat, and refreshing the heartbeat does not touch the wake target.
+
+Interlocks are created with a fixed 100 ms TTL. There is no arbitrary creation TTL: on RF-RTS,
+100 ms is a long time, and a longer init TTL is a footgun. A live-but-idle interlock (a paused
+capture cycle, an interlock alive but not incrementing) is kept fresh by touch, not by a long
+creation TTL.
+
+`touch_ms(N)` raises the TTL to `max(current, now + N)`. Pure heartbeat refresh, no counter
+change. It lives on the interlock, so counter and timer inherit it. The SDK's background thread
+auto-touches to keep a heartbeat fresh by default; explicit `touch_ms()` is the manual override
+for a known-idle period.
+
+A timer's wait couples two numbers into one. `wait_ms(5)` sets the wake target to clock plus 5 ms
+and raises the TTL to `now + 2 * wait` (default). The optional TTL override on the wait sets both
+the futex-timeout-crash threshold and the interlock TTL increment together, in lockstep, because
+they are the same number. A timer can therefore never be reaped while still legitimately waiting.
+
+Death detection is decentralized and falls out of the timer contract. A timer's futex wait has a
+timeout of 2 times the specified wait. On wake, the SDK compares: if the watched counter reached
+the target, RF-RTS woke you, proceed. If the futex timed out instead, RF-RTS did not wake you
+within 2 times your interval, so RF-RTS is dead: the SDK raises `RTSTimeout` and crashes the
+process. Higher-level code never sees it. Capture calls `wait_ms(5)`; if the call returns, it was
+fine. If RF-RTS died, the call never returns normally. The blocking wait is the liveness check, the
+same fail-safe shape as withholding a PLC pass signal: if it resumed, it was okay. This works only
+for timers, because only a timer knows its wake is time-bounded. A counter waiting on a line
+counter has no idea when it will cross, so a counter timeout means nothing and the counter owner
+decides how to handle it.
+
+## Wildebeest Mode: self-reaping, no detach
+
+There is no drop, no invalidate, no explicit detach. Stop using an interlock and its heartbeat
+lapses and RF-RTS reaps it. RF-RTS never faults and never asks why; it reaps and moves on. Create
+a named interlock that already exists and the previous one is reaped and you take over. So a
+process that restarts before the reap interval just recreates its interlock and resumes, and
+nobody is told anything.
+
+The one error a consumer sees from this: `InterlockReaped`. Go to wait on a counter whose backing
+interlock was reaped, because your own TTL lapsed or someone claimed your name, and you get
+`InterlockReaped`. From the caller's side the two causes are indistinguishable and the response is
+the same: recreate and resume, or crash. One error covers both.
+
+## The wait loop
 
 ```
-loop {
-    next += 10ms;
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next);   // absolute, not relative
-    tick_global.fetch_add(1, Release);                        // shared-memory atomic
-    futex_wake(&tick_global, ALL);                            // waiters re-read, compare, act
-}
+loop:
+    scan watched counters, wake waiters whose target was crossed
+    reap interlocks whose heartbeat TTL has expired
+    end = begin                          # cycle complete, RF-RTS idle-alive
+    sleep until the next whole-millisecond boundary (absolute, from a fixed anchor)
+    begin += 1                           # cycle start
 ```
 
-**The one non-negotiable: absolute deadlines** (`next += 10ms` against a running anchor,
-`TIMER_ABSTIME`). Relative `nanosleep` accumulates wakeup latency every cycle and drifts out
-of contract within a minute. Absolute re-anchors each tick to the monotonic clock, so jitter
-stays bounded per-tick instead of summing. Everything else is optional tuning.
+Compensated sleep to the whole-millisecond boundary keeps jitter sub-millisecond and lands events
+on integer milliseconds. The next boundary is computed from a fixed anchor, not from post-work
+`now`, so a heavy cycle does not drag the phase. begin advances at wake, end catches up at sleep,
+so begin greater than end means a cycle is in progress; the reliable death signal is the waiters'
+own futex timeouts, not this skew.
 
-**Why "do nothing" works:** CFS gives a runnable task its slice within a quantum (single-digit
-ms). To blow ±1 ms systematically you'd need all cores saturated with equal-or-higher-priority
-work across consecutive 10 ms windows — which 3–4 liveness checks/tick never produce. At worst
-synthetic full-machine load (`stress-ng --cpu 12`) it degrades to maybe ±5 ms, and at that load
-the box is already on fire and missing heartbeats for real reasons. Confidence the bare daemon
-holds 10 ms ±1 ms 1σ under normal load: ~90%.
+`now` in nanoseconds is roughly a ten-cycle operation. A thousand interlocks is a linear scan of a
+few thousand u64 reads per millisecond, trivial on an isolated application core. RF-RTS could run
+on an ESP32; the Jetson core it runs on has an order of magnitude more headroom.
 
-**Packaging:** core is just waitable counters + absolute-time loop → ships as a standalone
-daemon with **no Convoy dependency.** Convoy integration is an optional deployment mode.
-Viable as a standalone open-source release. ~6 months out; not a current deliverable.
+## Shared memory stays in the pod
 
----
+Interlock and buffer memory is memfd, passed by fd over UDS, never attached to a host-global
+shared region. Inside a Convoy pod, every interlock and buffer is held by the pod's Convoy daemon
+and passed down by fd; RF-RTS hands the daemon an interlock fd, the daemon passes it to pod
+containers. Kill the pod and every fd closes, the kernel reaps the memory, and RF-RTS sees the
+heartbeats lapse and reaps its records. Nothing is shared by name, only by fd, and fds die with
+their holders. Any data that leaves a Convoy pod is already a JPEG submitted over HTTP to the
+warehouse, so shared memory never crosses the pod boundary.
 
-## Tick vocabulary (child counters)
+## v0: build and test
 
-Same parent/child convention as Convoy's coordinate system. `tick_global` is the monotonic
-counter the singleton increments; channels are derived by mod.
+Lift the interlock and the fd handler from the existing Convoy daemon, thin them to this simpler
+form, add the 1 ms loop, the registry of watched counters, and the reaper. Compile to a single
+standalone Rust binary. Run it as a plain systemd service on the Jetson, unpinned and unisolated,
+and build against it.
 
-| Variable | Meaning |
-|----------|---------|
-| `tick_global` | Monotonic tick counter (the RTOS singleton increments this) |
-| `tick_10ms` | 10 ms channel: `tick_global mod (10ms / tick_interval)` |
-| `tick_25ms` | 25 ms channel |
-| `tick_50ms` | 50 ms channel |
-| `tick_100ms` | 100 ms health-check channel |
+Core pinning, isolation, and FIFO scheduling are not part of RF-RTS and not needed for v0. If
+RF-RTS is later pinned to an isolated core running SCHED_FIFO by Roboflow OS, RF-RTS neither knows
+nor cares; that is deployment, non-canonical to RF-RTS, and recorded elsewhere.
 
-A process subscribes to a channel by waiting on the appropriate child counter. Timer =
-interlock sugar: begin = "going to sleep", end = "wake up" (the RTOS fires it). The whole
-scheduling system is one primitive.
+Deliverable: the daemon binary plus a test container that accesses it exactly as any client would,
+so the tests prove the client contract, not just internal logic. Prove that timers fire, counters
+cross, heartbeats reap, create-over-existing reaps the old one, and a daemon restart wakes nobody
+while every waiter times out cleanly.
 
-**JWatch integration:** nanosecond timestamps on wake/sleep + CPU core ID as metadata.
-Measures exact jitter — this is how the ±1 ms claim gets verified rather than asserted.
+## Sequencing against Convoy
 
----
-
-## Escalation ladder (strictly optional, measurement-gated, LATER)
-
-Each rung buys tail-latency margin v0 doesn't need. Add only if JWatch shows the contract
-slipping — not as build steps.
-
-1. **SCHED_FIFO** — `cap_add: SYS_NICE` + `ulimits.rtprio` in compose, checked
-   `sched_setscheduler` (fail loud on EPERM, sentinel — don't run silently unpinned).
-2. **cpuset pin** — Docker `cpuset_cpus`, or self-pin via `sched_setaffinity` in-process.
-3. **isolcpus boot param** — evict others from the core (below).
-4. **PREEMPT_RT / nohz_full** — µs-shaving. Never needed for a liveness tick.
-
----
-
-## Full isolated-core architecture (the target layout, when we want it)
-
-This is where the design goes when it graduates from "background daemon" to "dedicated
-cores." Everything below is the measurement-gated target, not v0.
-
-### Core map — low-numbered fixed roles, workers grow upward
-
-Portable across SKUs: cores 0–5 are infrastructure, everything ≥6 is a worker slot.
-**Worker slots = `nproc − 6`.** 12-core AGX → 6 workers (6–11). 8-core part → 2 workers (6–7).
-Generate the isolcpus range from `nproc` at provision time; don't hand-anchor the end.
-
-| Cores | Role | Treatment |
-|-------|------|-----------|
-| 0 | IRQ sink + boot-required only | best-effort kept clear (not isolated; isolating CPU0 is disallowed) |
-| 1–3 | Housekeeping / scheduler | OS, Docker, RCU offload threads, background containers |
-| 4 | RTOS daemon | isolated + tickless + RCU-off, SCHED_FIFO ~80 on its own core |
-| 5 | NIC IRQ core | isolated; falls back to core 0 if IRQ unreroutable |
-| 6…N−1 | Convoy camera-worker pods (one per core, up to 6 cameras) | isolated; internal FIFO ladder |
-
-### extlinux boot line
-
-File: `/boot/extlinux/extlinux.conf`. Append to the `APPEND ${cbootargs}...` line under the
-primary `LABEL`. **Back up first** (`cp extlinux.conf extlinux.conf.bak`) — a malformed
-APPEND can fail to boot, and that's a bad day on a field Jetson with no SSH. Reboot required.
-
-12-core:
-```
-isolcpus=4-11 nohz_full=4,5 rcu_nocbs=4-11 rcu_nocb_poll irqaffinity=1-3
-```
-8-core:
-```
-isolcpus=4-7 nohz_full=4,5 rcu_nocbs=4-7 rcu_nocb_poll irqaffinity=1-3
-```
-
-Per-token:
-- `isolcpus=4-N` — pull all worker + infra cores off the load balancer. Nothing lands unless
-  explicitly placed. Compiled into stock L4T; works with no kernel rebuild.
-- `nohz_full=4,5` — tickless on the two determinism-sensitive cores (RTOS + IRQ) only.
-  Best-effort: **silently ignored if stock kernel lacks `CONFIG_NO_HZ_FULL`** — harmless,
-  that's fine, we're not depending on it.
-- `rcu_nocbs=4-N` — offload RCU callbacks off all isolated cores (see below).
-- `rcu_nocb_poll` — poll-mode offload, drops the wakeup IPIs.
-- `irqaffinity=1-3` — default all IRQs to housekeeping cores 1–3, leaving core 0 clear as
-  the sink for whatever's hard-wired to it.
-
-Verify after boot: `cat /sys/devices/system/cpu/isolated` → `4-11` (or `4-7`).
-
-### RCU callbacks — what `rcu_nocbs` does
-
-RCU (read-copy-update) defers freeing protected memory to a "callback" that normally runs in
-softirq context **on the same core that queued it**. On an isolated core that's uninvited work
-that steals cycles and re-arms the tick. `rcu_nocbs=<cores>` offloads those callbacks to
-dedicated `rcuo` kthreads running on the **non-isolated housekeeping cores** instead. The
-isolated core queues and moves on; core 1–3 does the cleanup. This is the mechanism that makes
-`isolcpus` actually quiet rather than nominally quiet. `rcu_nocb_poll` makes the offload threads
-poll rather than wake by IPI — one fewer interrupt on the isolated side.
-
-### NIC IRQ pinning — best-effort, can't lose
-
-Try to move the NIC IRQ onto core 5 (or 0). If Tegra wiring won't allow it, it stays on 0,
-which is already reserved for exactly that.
-
-```bash
-grep eth0 /proc/interrupts                              # left column = IRQ number(s)
-echo 5 | sudo tee /proc/irq/<IRQ>/smp_affinity_list     # try to place it
-cat /proc/irq/<IRQ>/effective_affinity_list             # PROOF it moved — must read 5, not 0
-```
-
-**Tegra gotcha:** many Jetson IRQs are hard-wired to CPU0 and cannot be reaffined — the kernel
-accepts the write, silently ignores it, routes back to a core that can service it. Always check
-`effective_affinity_list`, not just that the write succeeded. If it won't leave 0, that's
-hardware, not config — and core 0 is the reserved sink, so the design holds either way. Multi-
-queue NICs have one IRQ per queue; knock to single queue with `ethtool -L eth0 combined 1` if
-you want one IRQ to place. `/proc/irq/*` resets on reboot → make persistent with a systemd unit
-or rc.local; `irqaffinity=1-3` sets the boot default, the runtime write is the exception that
-needs re-applying each boot.
-
-Runtime proof the isolation held (sample twice, seconds apart): `cat /proc/interrupts` — core 0
-takes the NIC deltas, isolated cores show near-zero IRQ growth.
-
----
-
-## Worker-pod scheduling — SCHED_FIFO ladder, NOT nice
-
-Each worker core runs one Convoy pod = four operations: **capture, inference, save, Convoy
-daemon.** These get strict RT priorities, not `nice`.
-
-| Process | Policy / prio | Rationale |
-|---------|---------------|-----------|
-| capture | FIFO 90 | 3 ms of work per 30 ms cycle, then blocks on next frame. Hard-preempts everything to grab the frame instantly, then self-suspends. |
-| inference | FIFO 80 | Runs every spare cycle while capture sleeps. Yields on every GPU sync (H2D / kernel / D2H) — those stalls are free yield points. |
-| Convoy daemon | FIFO 75 | Woken every 10 ms tick, runs sub-ms, has a *timing* obligation (TTL checks / liveness) so it must run on-time. Above save because a wedged daemon that misses its save trigger is worse than a slow save. |
-| save | FIFO 70 | Fills inference's GPU-wait gaps interstitially. Slipping a few ms is harmless — frame's already safe in memory. Finishes after the inference result lands. |
-
-RTOS daemon on core 4 is FIFO ~80 on its *own* isolated core, unrelated to this ladder.
-
-### Why RT and not nice — the reasoning that flipped it
-
-Initial instinct was `nice` (capture −19 / inference 0 / save 19) because FIFO can starve.
-**It can't here, because the tasks are duty-cycled, not continuous.** Capture is 3 ms/30 ms
-then blocks; a blocked FIFO task yields immediately to the next-highest runnable task. So
-capture-at-90 means "stop everything, grab the frame, get out of the way" — exactly the
-semantics wanted. `nice=-19` capture would instead let inference steal cycles during the 3 ms
-acquisition window, adding jitter to the one thing that must be crisp. RT gives the hard
-preempt; nice doesn't.
-
-Inference yields naturally: it's CPU-then-wait-then-CPU around GPU round-trips. Every H2D copy,
-kernel launch, D2H copy blocks on CUDA sync → the FIFO inference thread yields → save (FIFO 70)
-runs in the gap → preempted the instant inference is runnable again. Interstitial save-during-
-inference-wait for free, no interleaving logic. The GPU stalls *are* the yield points.
-
-The dependency chain (no save without inference, no inference without capture) is enforced by
-**data flow**, not just priority: inference blocks waiting on capture's frame, save blocks
-waiting on inference's result. Priority ladder and dependency graph agree, so a lower task can't
-starve a higher one it feeds, and the higher task always self-suspends.
-
-### The two hygiene items (the only failure modes left in an all-FIFO pod)
-
-1. **Priority-inherit any cross-level mutex.** Classical unbounded priority inversion needs a
-   shared lock held by a low-prio task blocking a high one. The chain doesn't have that shape
-   (capture waits on hardware, not a lock save holds) — but if any mutex is shared across levels
-   (shared allocator, producer/consumer queue lock), set `PTHREAD_PRIO_INHERIT` on it. Bounded
-   inversion is a known, accepted RTOS condition; PI closes the unbounded case.
-2. **Keep all FIFO priorities ≤ 90**, below the kernel migration/watchdog threads at 99. A
-   userspace task at 99 can wedge the core against kernel maintenance. Already satisfied; don't
-   drift up.
-
----
-
-## Deployment target notes
-
-Current Vantive stack: **Docker Compose on stock JetPack 6.2 + L4T** — no MicroK8s, no RF OS.
-So v0 container mechanics are Compose-native (`cpuset_cpus`, `cap_add: SYS_NICE`,
-`ulimits.rtprio`), not kubelet CPU-manager. Kubernetes is a planned move; when it lands, the
-CPU-manager static-policy path from `research-rf-rtos.md` §3 applies. If the target ever becomes
-RF OS (Yocto over L4T), the kernel-config availability of nohz_full/isolcpus/PREEMPT_RT reopens
-separately — see the Alex/RF-OS brief. For the current box, all of the above works as written.
-
-Whole Vantive stack uncontained/unisolated at full speed uses **4–5 cores total** (inference 3,
-background 1–2). Under the isolated map that fits in housekeeping (1–3) with room; the isolated
-side stays pristine. No contention concern at current load.
-
----
+Convoy is at code and already contains the interlock and the fd handler. This design re-homes the
+interlock into RF-RTS: Convoy depends on RF-RTS, not the reverse. So freeze this contract (done, in
+`design/CONTRACTS.md`), pin Convoy's interlock work, build RF-RTS by lifting and thinning that
+code, then point the Convoy conversation at the running service and let Fable rework Convoy's
+interlock-touching code into RF-RTS-client code. Convoy loses its in-process interlock and gains a
+UDS client, a smaller surface: Convoy becomes a shared-memory data mover, RF-RTS coordinates.
 
 ## Start here (next session)
 
-1. Write the v0 daemon (Rust): self-pin optional, absolute-time `clock_nanosleep` loop,
-   `tick_global` atomic in `/dev/shm`, `futex_wake` on increment, child-counter channels.
-   Fail loud on any setup syscall error (sentinel, greppable).
-2. Wire JWatch: ns timestamps on wake/sleep + core ID → measure actual jitter vs the ±1 ms
-   claim under real capture+inference load.
-3. Ship v0 as-is if the histogram holds. Only then, if a tail shows up, walk the escalation
-   ladder — SCHED_FIFO first, isolcpus only if a neighbor is measurably stealing time.
-4. The isolated-core architecture + FIFO worker ladder above is the graduation target when
-   rf-RTOS moves from standalone daemon to the Convoy per-core deployment.
+1. Freeze confirmed in `design/CONTRACTS.md`. Read it and `design/ARCHITECTURE.md`.
+2. Build the daemon: lift interlock and fd handler from Convoy, add the 1 ms compensated loop, the
+   watched-counter registry, the reaper, the two UDS calls. Standalone Rust binary, systemd,
+   unpinned.
+3. Build the SDK: Rust core (attach, timer, counter, wait_ms, touch_ms, background touch thread,
+   RTSTimeout crash, InterlockReaped), pyo3 Python binding over it.
+4. Test container: prove the contract from the client side.
+5. Point the Convoy conversation at the running service; Fable reworks Convoy into an RF-RTS
+   client.
