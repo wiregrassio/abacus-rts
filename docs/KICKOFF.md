@@ -174,6 +174,16 @@ code, then point the Convoy conversation at the running service and let Fable re
 interlock-touching code into RF-RTS-client code. Convoy loses its in-process interlock and gains a
 UDS client, a smaller surface: Convoy becomes a shared-memory data mover, RF-RTS coordinates.
 
+## Forge cycle
+
+The daemon and the SDK are two artifacts, and the SDK is a client over the daemon. Compose the
+daemon architecture first and close all its review rounds (no HIGH finding surviving) before
+composing the SDK, whose contract is written from the daemon's ratified surface. Do not feed both
+into one cycle: a client artifact composed before its base closes gets discarded (Forge's own
+Convoy lesson). Forge composes from `design/ARCHITECTURE.md` and `design/state-machines/`, with
+`design/CONTRACTS.md` as the promoted deliverable; it does not build from this KICKOFF. Review runs
+as external API calls, never in-context; if the keys or scripts cannot run, stop.
+
 ## Start here (next session)
 
 1. Freeze confirmed in `design/CONTRACTS.md`. Read it and `design/ARCHITECTURE.md`.
