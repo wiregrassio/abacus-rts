@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/abacus-core", "crates/abacus-daemon", "crates/abacus-client", "crates/abacus-tests"]
+resolver = "2"

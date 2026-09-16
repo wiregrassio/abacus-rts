@@ -1,7 +1,7 @@
 <purpose>
 # docs/
 
-RF-RTS documentation. The LLM kickoff (read-cold entry point) and the architecture-rung design set
+Abacus RTS documentation. The LLM kickoff (read-cold entry point) and the architecture-rung design set
 that Forge consumes.
 </purpose>
 

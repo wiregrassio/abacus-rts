@@ -1,0 +1,10 @@
+[package]
+name = "abacus-client"
+version = "0.1.0"
+edition = "2021"
+description = "Abacus RTS client SDK"
+
+[dependencies]
+abacus-core = { path = "../abacus-core" }
+abacus-daemon = { path = "../abacus-daemon" }
+libc = "0.2"

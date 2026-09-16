@@ -1,0 +1,8 @@
+[package]
+name = "abacus-core"
+version = "0.1.0"
+edition = "2021"
+description = "Abacus RTS core: interlock primitive, clock, error types"
+
+[dependencies]
+libc = "0.2"

@@ -1,0 +1,11 @@
+[package]
+name = "abacus-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Integration tests for Abacus RTS"
+
+[dependencies]
+abacus-core = { path = "../abacus-core" }
+abacus-daemon = { path = "../abacus-daemon" }
+abacus-client = { path = "../abacus-client" }
+libc = "0.2"

@@ -1,0 +1,13 @@
+[package]
+name = "abacus-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Abacus RTS daemon: the 1 ms coordination loop"
+
+[[bin]]
+name = "abacus"
+path = "src/main.rs"
+
+[dependencies]
+abacus-core = { path = "../abacus-core" }
+libc = "0.2"

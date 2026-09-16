@@ -1,11 +1,12 @@
-# RF-RTS
+# Abacus RTS
 
-The Roboflow Real-Time Scheduler. A coordination primitive daemon for real-time processes on
-NVIDIA Jetson and anything else that needs it.
+Lockless atomic coordination for real-time compute. A coordination primitive daemon for
+real-time processes on GPU edge devices and anything else that needs sub-millisecond
+coordination.
 
-Status: pre-implementation design phase.
+Status: v0 daemon implemented. SDK and test container pending.
 
-RF-RTS provides one primitive, the interlock: three u64 words (begin, end, heartbeat), two of
+Abacus provides one primitive, the interlock: three u64 words (begin, end, heartbeat), two of
 them futex-waitable, all monotonic and non-negative. The daemon runs a 1 ms best-effort loop
 that reaps interlocks whose heartbeat has expired and wakes waiters whose watched counter has
 crossed their target. Counters and timers are contracts layered over the interlock by the client
@@ -15,8 +16,8 @@ Runs as a systemd service with zero dependencies but systemd. Small enough to fi
 restart in milliseconds. It holds no durable state: a restart comes back empty, wakes no one, and
 every waiter discovers the restart through its own futex timeout. Crash-only by design.
 
-Other systems depend on RF-RTS. Convoy, once reworked, uses it for all coordination; Convoy
-becomes a shared-memory data mover and RF-RTS owns the interlock.
+The interlock primitive is designed to be depended on by other systems needing shared
+coordination: a consumer can become a shared-memory data mover while Abacus owns the interlock.
 
 ## Reading order
 

@@ -1,6 +1,6 @@
-# RF-RTS design
+# Abacus design
 
-The architecture rung for RF-RTS. This directory is what Forge consumes: it reads the
+The architecture rung for Abacus. This directory is what Forge consumes: it reads the
 architecture, generates a spec, then an implementation, then code. Everything here is design, no
 executable content. CONTRACTS.md is also the freeze that Convoy builds against and Fable
 regenerates from.
@@ -11,10 +11,10 @@ regenerates from.
 
 One primitive: the interlock. Three u64 words in a memfd.
 
-- `begin`: futex-waitable, monotonic, incremented when work starts or when RF-RTS begins a cycle.
-- `end`: futex-waitable, monotonic, incremented when work completes or when RF-RTS ends a cycle.
+- `begin`: futex-waitable, monotonic, incremented when work starts or when Abacus begins a cycle.
+- `end`: futex-waitable, monotonic, incremented when work completes or when Abacus ends a cycle.
 - `heartbeat`: a CLOCK_MONOTONIC nanosecond timestamp. Future means alive, past means the owner is
-  gone. Reaped by RF-RTS when it falls into the past.
+  gone. Reaped by Abacus when it falls into the past.
 
 All monotonic, non-negative, incremented by arbitrary amounts, never decremented. Counter and
 timer are contracts over this, not new structures.
@@ -25,15 +25,15 @@ timer are contracts over this, not new structures.
 
 ## Three contracts
 
-- Interlock. RF-RTS reaps it when the heartbeat TTL expires. That is the only thing RF-RTS does to
+- Interlock. Abacus reaps it when the heartbeat TTL expires. That is the only thing Abacus does to
   a bare interlock. begin and end advancing, and futex waits on them, happen entirely outside
-  RF-RTS. A consumer using an interlock only for its own coordination never involves the daemon
+  Abacus. A consumer using an interlock only for its own coordination never involves the daemon
   beyond create, attach, and reaping.
-- Counter. An interlock RF-RTS watches. RF-RTS wakes waiters when the counter crosses their target.
+- Counter. An interlock Abacus watches. Abacus wakes waiters when the counter crosses their target.
   The owner declares its own TTL and owns what a timeout means, because nothing can bound when an
   arbitrary counter will cross.
 - Timer. A counter whose watched interlock is the system clock, units milliseconds, futex timeout
-  fatal. RF-RTS sets the TTL from the wait duration. This is the only contract where a timeout is a
+  fatal. Abacus sets the TTL from the wait duration. This is the only contract where a timeout is a
   death signal, because only a timer knows its wake is time-bounded.
 
 </three-contracts>
@@ -43,12 +43,12 @@ timer are contracts over this, not new structures.
 ## The system clock is an interlock
 
 Time is not special. The system clock is an interlock whose `end` counter is the millisecond
-count. RF-RTS increments it on its own loop: `begin` at wake, `end` at sleep. A timer is a counter
+count. Abacus increments it on its own loop: `begin` at wake, `end` at sleep. A timer is a counter
 watching this interlock's counter; "wake me in 5 ms" is "wake me when the clock's counter crosses
 now plus 5." The same watch-and-wake machinery serves time and progress; only the watched
 interlock differs.
 
-Because RF-RTS advances the clock's begin at wake and end at sleep, `begin > end` means a cycle is
+Because Abacus advances the clock's begin at wake and end at sleep, `begin > end` means a cycle is
 in progress. This is not the death signal (a single read cannot distinguish in-progress from
 died-mid-cycle). The reliable death signal is decentralized: each timer's own futex timeout.
 
@@ -58,7 +58,7 @@ died-mid-cycle). The reliable death signal is decentralized: each timer's own fu
 
 ## Daemon and SDK
 
-RF-RTS is two parts.
+Abacus is two parts.
 
 The daemon is the systemd binary. Its 1 ms loop reaps expired interlocks and wakes counter-crossers.
 It hands out interlock fds over UDS through two calls, create and attach. It knows nothing about
@@ -84,7 +84,7 @@ less. The heartbeat word and the wake-target are different u64s, so setting a wa
 disturb the heartbeat and refreshing the heartbeat does not disturb the wake target; the old
 "cannot decrement a future TTL" concern does not arise.
 
-Interlocks are created with a fixed 100 ms TTL. There is no arbitrary creation TTL: on RF-RTS
+Interlocks are created with a fixed 100 ms TTL. There is no arbitrary creation TTL: on Abacus
 100 ms is long, and a longer init TTL invites misuse. A live-but-idle interlock, such as a paused
 capture cycle that is alive but not incrementing, is kept fresh with touch.
 
@@ -104,8 +104,8 @@ legitimately waiting.
 ## Death detection
 
 Decentralized, emergent, no central health check. A timer's futex wait times out at 2 times the
-specified wait. On wake the SDK compares: watched counter reached target means RF-RTS woke you,
-proceed; futex timed out means RF-RTS did not wake you within 2 times your interval, so RF-RTS is
+specified wait. On wake the SDK compares: watched counter reached target means Abacus woke you,
+proceed; futex timed out means Abacus did not wake you within 2 times your interval, so Abacus is
 dead, and the SDK raises `RTSTimeout` and crashes the process. Higher-level code never sees it: the
 blocking wait is the liveness check, and if the call returned, it was fine. This is the same
 fail-safe shape as withholding a downstream pass signal.
@@ -120,7 +120,7 @@ counter cannot interpret a timeout, so the counter owner decides.
 ## Wildebeest Mode: self-reaping
 
 No drop, no invalidate, no explicit detach. Stop using an interlock and its heartbeat lapses and
-RF-RTS reaps it. RF-RTS never faults; it reaps and moves on. Create a named interlock that exists
+Abacus reaps it. Abacus never faults; it reaps and moves on. Create a named interlock that exists
 and the previous one is reaped and you take over, so a process restarting before the reap interval
 recreates its interlock and resumes with nobody told.
 
@@ -143,7 +143,7 @@ integer milliseconds, and anchoring the next boundary rather than measuring from
 keeps a heavy cycle from dragging the phase.
 
 The scan is a linear pass over the registered interlocks, a few thousand u64 reads per millisecond
-for a thousand interlocks, trivial on an application core. RF-RTS holds no durable state, so a
+for a thousand interlocks, trivial on an application core. Abacus holds no durable state, so a
 restart returns empty, wakes no one, and is discovered by every waiter's own timeout: a cold
 restart is correct behavior, not recovery.
 
@@ -155,8 +155,8 @@ restart is correct behavior, not recovery.
 
 Interlock memory is memfd, passed by fd over UDS through SCM_RIGHTS, never attached to a
 host-global region and never requiring a shared IPC namespace. fd passing crosses namespaces on its
-own. Inside a Convoy pod the Convoy daemon holds the interlock fds RF-RTS hands it and passes them
-to pod containers; killing the pod closes every fd, the kernel reaps the memory, and RF-RTS reaps
+own. Inside a Convoy pod the Convoy daemon holds the interlock fds Abacus hands it and passes them
+to pod containers; killing the pod closes every fd, the kernel reaps the memory, and Abacus reaps
 its records when the heartbeats lapse. Nothing is shared by name, only by fd, and fds die with
 their holders. Data leaving a pod is already a JPEG over HTTP to the warehouse, so shared memory
 never crosses the pod boundary.
@@ -167,9 +167,9 @@ never crosses the pod boundary.
 
 ## Out of scope
 
-RF-RTS knows nothing about who uses it, how they are scheduled, or what happens when they die. Core
+Abacus knows nothing about who uses it, how they are scheduled, or what happens when they die. Core
 pinning, isolation, SCHED_FIFO placement, the Convoy pod layout, and any fail-safe cascade are
-deployment and consumer concerns, non-canonical to RF-RTS, and are not recorded in this repo. If
-RF-RTS is pinned to an isolated core by Roboflow OS, RF-RTS neither knows nor cares.
+deployment and consumer concerns, non-canonical to Abacus, and are not recorded in this repo. If
+Abacus is pinned to an isolated core by the host OS, Abacus neither knows nor cares.
 
 </out-of-scope>
