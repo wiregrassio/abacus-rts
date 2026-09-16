@@ -3,12 +3,10 @@
 //! Each test starts a daemon in a background thread and exercises the SDK
 //! against it. Tests prove the client contract, not internal daemon logic.
 
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use abacus_client::{
-    AbacusClient, Interlock, WaitCounter, WaitTimer, WatchedWord, WaitState,
-    ProcessClock, ClockHandle, AttachedWaitCounter,
+    AbacusClient, WatchedWord, WaitState,
 };
 use abacus_tests::{start_daemon, cleanup};
 
@@ -31,7 +29,6 @@ fn timer_fires_within_tolerance() {
         "expected Normal or Overrun, got {:?}",
         result.state
     );
-    // Should complete within 50ms + daemon resolution (1ms) + scheduling margin.
     assert!(
         elapsed < Duration::from_millis(100),
         "timer took too long: {:?}",
@@ -64,15 +61,13 @@ fn wait_counter_wakes_on_interlock_advance() {
     ).unwrap();
 
     // Advance the source in a background thread after a short delay.
-    let source_handle = source.handle_internal();
+    // Use the public API: source.close(10) advances closed_count by 10.
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(30));
-        // Advance closed_count to 10.
-        source_handle.words().closed_count.fetch_add(10, Ordering::Release);
-        abacus_core::clock::futex_wake(&source_handle.words().closed_count);
+        source.close(10);
     });
 
-    // Wait for the counter to cross target 5.
+    // Wait for the counter to cross target 5 (500ms timeout).
     let result = counter.wait_until(5, 500).unwrap();
 
     assert!(
@@ -94,19 +89,15 @@ fn wait_counter_wakes_on_interlock_advance() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn interlock_is_reaped_when_touch_stops() {
+fn interlock_is_reaped_when_not_touched() {
     let path = start_daemon("heartbeat-reap");
     let mut client = AbacusClient::connect(&path).unwrap();
 
-    // Create an interlock with a touch thread.
-    let mut il = client.create_interlock("ephemeral").unwrap();
+    // Create an interlock but do NOT start a touch thread.
+    // The creation TTL is 100ms, so it will expire.
+    let il = client.create_interlock("ephemeral").unwrap();
 
-    // Start and immediately stop the touch thread. The interlock's TTL will
-    // lapse within 100ms (creation TTL).
-    let touch = il.start_touch_thread(40);
-    drop(touch);
-
-    // Wait for the daemon to reap it (100ms TTL + up to 1ms daemon cycle).
+    // Wait for the daemon to reap it (100ms TTL + margin).
     std::thread::sleep(Duration::from_millis(150));
 
     // Touch should return InterlockReaped.
@@ -125,16 +116,18 @@ fn wildebeest_reaps_old_interlock() {
     let path = start_daemon("wildebeest");
     let mut client = AbacusClient::connect(&path).unwrap();
 
-    // Create a named interlock.
-    let il1 = client.create_interlock("contested").unwrap();
+    // Create a named interlock and keep it alive.
+    let mut il1 = client.create_interlock("contested").unwrap();
+    let _touch1 = il1.start_touch_thread(40);
     il1.open(42);
 
     // Create the same name again (Wildebeest Mode).
     let il2 = client.create_interlock("contested").unwrap();
 
-    // The old handle should detect reap on next touch.
-    // Give the daemon a cycle to process.
+    // Give the daemon a cycle to process the reap.
     std::thread::sleep(Duration::from_millis(5));
+
+    // The old handle should detect reap on next touch.
     let result = il1.touch(100);
     assert!(result.is_err(), "old interlock should be reaped after name collision");
 
