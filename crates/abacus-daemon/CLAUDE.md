@@ -1,0 +1,32 @@
+<purpose>
+# abacus-daemon/
+
+Abacus daemon binary. A poll()-based 1ms event loop that evaluates every interlock each cycle:
+reap expired, stamp and wake watched interlocks whose conditions are met, advance the system
+clock. Persistent UDS connections with SCM_RIGHTS fd passing.
+</purpose>
+
+<files>
+## Files
+
+| File | Purpose |
+|------|---------|
+| `lib.rs` | Module declarations: daemon, registry, transport, wire. |
+| `main.rs` | Binary entry point: parse --socket-path, call daemon_run. Binary name: `abacus`. |
+| `daemon.rs` | daemon_run: poll()-based event loop. Connection table, POLLIN/POLLHUP handling, clock advancement, evaluate_all dispatch. |
+| `registry.rs` | Interlock registry: Tier enum (Interlock, WaitCounter, WaitTimer, WaitCron, WaitBarrier), evaluate_all (single-pass reap + wake), Wildebeest create-over-existing, clock as named "clock" entry. |
+| `wire.rs` | Wire protocol v1: Request/Response enums, encode/decode, tier-specific payloads for all 5 tiers. |
+| `transport.rs` | UDS server (non-blocking accept), Connection (send/recv with SCM_RIGHTS), WouldBlock handling. |
+</files>
+
+<contracts>
+## Contracts
+
+- The daemon evaluates every interlock every 1ms cycle (best-effort).
+- Reap only on expired TTL. Overrun is informational, not daemon-fatal.
+- The "clock" name is reserved. create("clock") is rejected.
+- One fd per response. The clock is attached separately by name.
+- Persistent connections: clients connect once, send many requests.
+- WouldBlock on a client fd: skip this cycle, keep connection.
+- Connection death (EOF/EPIPE): remove client from table, no reap.
+</contracts>

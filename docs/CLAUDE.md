@@ -1,24 +1,15 @@
 <purpose>
 # docs/
 
-Abacus RTS documentation. The LLM kickoff (read-cold entry point) and the architecture-rung design set
-that Forge consumes.
+Abacus RTS documentation. The LLM kickoff and the design rung.
 </purpose>
-
-<contracts>
-## Contracts
-
-- Read `KICKOFF.md` first. It is the cold-start brief for the whole project.
-- `design/` is the architecture rung. It is what Forge takes as input to produce the spec.
-- HOUSE_STYLE governs every file here. No em or en dashes.
-</contracts>
 
 <files>
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `KICKOFF.md` | LLM entry point. Thesis, the one-primitive-three-contracts model, the daemon and SDK split, the build plan. Read cold. |
+| `KICKOFF.md` | Cold-start LLM entry point. Read first. |
 </files>
 
 <subdirectories>
@@ -26,5 +17,5 @@ that Forge consumes.
 
 | Directory | Purpose |
 |-----------|---------|
-| `design/` | The architecture rung: ARCHITECTURE, CONTRACTS, state machines. Forge consumes this. |
+| `design/` | LIFECYCLE (state machine), CONTRACTS (frozen interface), SURFACE (SDK API), ARCHITECTURE (flowing argument). |
 </subdirectories>
