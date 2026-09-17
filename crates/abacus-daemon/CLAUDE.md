@@ -30,3 +30,26 @@ clock. Persistent UDS connections with SCM_RIGHTS fd passing.
 - WouldBlock on a client fd: skip this cycle, keep connection.
 - Connection death (EOF/EPIPE): remove client from table, no reap.
 </contracts>
+
+<dependencies>
+## Dependencies
+
+- Internal: `abacus-core` for interlock layout, clock primitives, error types, futex helpers.
+- External: `libc` for poll(), socket operations, SCM_RIGHTS ancillary data, signal handling.
+- Rust std: io, os::unix, net, thread, time.
+</dependencies>
+
+<consumed-by>
+## Consumed By
+
+- `abacus-client`: imports wire codec types (Request, Response enums) for encode/decode. This is a known coupling; the wire types should live in a shared crate.
+- `abacus-tests`: starts daemon_run in a background thread for integration testing.
+</consumed-by>
+
+<data-flow>
+## Data Flow
+
+- **In:** UDS connections arrive via non-blocking accept. Framed binary requests (Create, Attach) decoded from each connection.
+- **Through:** Registry maps names to interlock entries with tier metadata. Each 1ms cycle: advance the clock interlock, evaluate_all (single pass: reap expired, stamp and wake watched interlocks whose conditions are met).
+- **Out:** Created/Attached responses with SCM_RIGHTS fd passing back to clients. Futex wakes on interlock words for cross-process signaling.
+</data-flow>

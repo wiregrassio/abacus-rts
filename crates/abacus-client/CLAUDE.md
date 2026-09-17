@@ -34,3 +34,32 @@ with timeout detection and background keepalive.
 - Touch thread refreshes expiration at 40ms intervals (2.5 ticks per 100ms TTL).
 - Known coupling: depends on abacus-daemon for wire codec types. Extract to shared crate is planned.
 </contracts>
+
+<dependencies>
+## Dependencies
+
+- Internal: `abacus-core` for interlock layout, clock primitives, error types, futex helpers. `abacus-daemon` for wire codec types (Request/Response enums, encode/decode).
+- External: `libc` for UDS connect, SCM_RIGHTS recv, futex_wait.
+- Rust std: io, os::unix, net, thread, sync (Arc, atomic), time.
+</dependencies>
+
+<consumed-by>
+## Consumed By
+
+- `abacus-tests`: the test suite exercises the full SDK surface against a live daemon.
+- Downstream consumers (Convoy, application code): link this crate to coordinate via Abacus.
+</consumed-by>
+
+<data-flow>
+## Data Flow
+
+- **In:** AbacusClient::connect opens a UDS to the daemon, sends Create/Attach requests, receives responses with fds via SCM_RIGHTS.
+- **Through:** Typed handles (Interlock, WaitCounter, WaitTimer, WaitCron, WaitBarrier, ProcessClock) wrap the mapped interlock memory. Background TouchThread refreshes expiration_ns at 40ms intervals.
+- **Out:** Wait primitives (wait_ms, wait_until, wait) block on futex_wait against interlock words. Returns WaitResult with completed_at and WaitState. RTSTimeout aborts the process for timer failures.
+</data-flow>
+
+<known-hazards>
+## Known Hazards
+
+- **MEDIUM:** Wire codec coupling. The client imports Request/Response types directly from `abacus-daemon::wire`. A daemon wire format change forces a client rebuild. Planned fix: extract wire types to `abacus-core` or a dedicated `abacus-wire` crate.
+</known-hazards>
