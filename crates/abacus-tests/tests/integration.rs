@@ -378,9 +378,11 @@ fn attacher_free_terminates_interlock() {
     // Give the daemon a cycle to see the sentinel and reap.
     std::thread::sleep(Duration::from_millis(5));
 
-    // The name should be gone from the registry. A new create should succeed cleanly.
-    let il2 = client.create_interlock("shared").unwrap();
-    assert_eq!(il2.value(), 0);
+    // Discriminating check: the daemon must have already reaped the entry
+    // from the sentinel (not Wildebeest). Attach should fail because the
+    // name is gone from the registry.
+    let attach_result = client.attach_interlock("shared");
+    assert!(attach_result.is_err(), "attach after free() should return InterlockNotFound");
 
     cleanup(&path);
 }
