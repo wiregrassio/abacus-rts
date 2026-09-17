@@ -328,3 +328,59 @@ fn interlock_open_close_value() {
 
     cleanup(&path);
 }
+
+// ---------------------------------------------------------------------------
+// 12. free() terminates an interlock immediately
+// ---------------------------------------------------------------------------
+
+#[test]
+fn free_terminates_interlock() {
+    let path = start_daemon("free-terminate");
+    let mut client = AbacusClient::connect(&path).unwrap();
+
+    let mut il = client.create_interlock("doomed").unwrap();
+    il.open(1);
+
+    // free() should set the sentinel and stop the touch thread.
+    il.free();
+
+    // Touch should detect the sentinel immediately (no daemon cycle needed).
+    let result = il.touch(100);
+    assert!(result.is_err(), "touch after free() should return InterlockReaped");
+
+    // Give the daemon a cycle to clean up the registry entry.
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Creating the same name should succeed (Wildebeest: the old entry is gone).
+    let il2 = client.create_interlock("doomed").unwrap();
+    let (open, closed) = il2.peek();
+    assert_eq!(open, 0);
+    assert_eq!(closed, 0);
+
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Attacher free() terminates via counter sentinel
+// ---------------------------------------------------------------------------
+
+#[test]
+fn attacher_free_terminates_interlock() {
+    let path = start_daemon("attacher-free");
+    let mut client = AbacusClient::connect(&path).unwrap();
+
+    let _owner = client.create_interlock("shared").unwrap();
+    let attached = client.attach_interlock("shared").unwrap();
+
+    // Attacher free() writes SENTINEL to open_count.
+    attached.free();
+
+    // Give the daemon a cycle to see the sentinel and reap.
+    std::thread::sleep(Duration::from_millis(5));
+
+    // The name should be gone from the registry. A new create should succeed cleanly.
+    let il2 = client.create_interlock("shared").unwrap();
+    assert_eq!(il2.value(), 0);
+
+    cleanup(&path);
+}
