@@ -32,6 +32,10 @@ client.create_interlock(name) -> Interlock
 client.attach_interlock(name) -> AttachedInterlock
     Attach to an existing interlock by name. Returns a mapped handle.
     Attacher: open_count r/w, closed_count r/w, expiration r/o.
+    attached.free(&self) writes SENTINEL to open_count and wakes waiters on both
+    open_count and closed_count. The attacher has no write access to expiration_ns,
+    so free() signals termination through the counters instead of through
+    interlock_free (see Termination, below).
 
 interlock.open(h)                       open_count += h
 interlock.close(h)                      closed_count += h
@@ -40,7 +44,19 @@ interlock.peek() -> (open, closed)      read both counters
 interlock.wait_open(target) -> u64      futex_wait on open_count >= target
 interlock.wait_close(target) -> u64     futex_wait on closed_count >= target
 interlock.value() -> i64                open_count - closed_count
+interlock.stop_touch_thread(&mut self)  stops the touch thread without terminating
+                                         the interlock (see Background touch, below)
+interlock.free(&mut self)               stops the touch thread, then frees the
+                                         interlock (see Termination, below)
 ```
+
+wait_open and wait_close check the loaded word against SENTINEL (u64::MAX, the
+terminal marker) before comparing it to target: SENTINEL would otherwise satisfy
+any `>= target` comparison and be returned as a valid value. A word equal to
+SENTINEL returns InterlockReaped immediately. After each futex wake, the same
+wait also re-checks expiration_ns: if expiration_ns == SENTINEL, or expiration_ns
+has already passed, wait_open/wait_close return InterlockReaped rather than
+looping again.
 
 ### Derived state (read-only)
 
@@ -52,7 +68,7 @@ interlock.state() -> InterlockState::Closed | InterlockState::Open | InterlockSt
 
 | Error | When | Response |
 |-------|------|----------|
-| InterlockReaped | TTL lapsed or name claimed by another create | recreate and resume, or crash |
+| InterlockReaped | TTL lapsed, name claimed by another create, or a word read as SENTINEL (daemon reap or client free()) | recreate and resume, or crash |
 
 </interlock-api>
 
@@ -73,10 +89,16 @@ wait_counter.wait_until(target, timeout_ms) -> Result<WaitResult, SdkError>
     timeout_ms is the futex poll cadence in milliseconds. TTL is set to
     2 * timeout_ms. Use 100 for standard waits, higher for long-running watches.
     Blocks (futex_wait on closed_count) until daemon stamps closed_count.
+    Reaped detection checks expiration_ns == SENTINEL, not == 0: if SENTINEL,
+    returns InterlockReaped. A genuine futex timeout (the OS reports ETIMEDOUT,
+    expiration_ns is still a real value) is different: it returns
+    WaitResult { state: Timeout } instead of an error, or loops and re-checks.
     Returns WaitResult { completed_at, state }.
 
 wait_counter.touch(ms)                  extend TTL
 wait_counter.peek() -> (open, closed)   read both counters
+wait_counter.free(&mut self)            stops the touch thread, then frees the
+                                         interlock (see Termination, below)
 ```
 
 ### SDK aliases
@@ -102,7 +124,9 @@ enum WaitState {
 ```
 
 For WaitCounter, Timeout handling is the owner's decision. The SDK surfaces it; the owner
-decides whether to retry, crash, or ignore.
+decides whether to retry, crash, or ignore. SENTINEL is a separate, harder condition: it
+means the interlock itself was reaped or freed, not merely that the daemon has not yet
+delivered, and it always raises InterlockReaped instead of returning a WaitResult.
 
 </wait-counter-api>
 
@@ -118,15 +142,21 @@ client.create_wait_timer(name) -> WaitTimer
     Auto-watches clock.closed_count. No watched_name or watched_word needed.
 
 wait_timer.wait_ms(ms) -> WaitResult
-    Sets open_count = clock.closed_count + ms.
+    Sets open_count = clock.open_count + ms (plain addition: clock_now + ms, not
+    saturating_add). clock.open_count is the clock's advancing "current time"
+    counter (see Clock, below).
     Raises expiration to max(current, now + 2 * ms).
     Blocks until daemon stamps closed_count.
+    Reaped detection checks expiration_ns == SENTINEL, not == 0: if SENTINEL,
+    returns InterlockReaped immediately, before the fatal-timeout check below.
     Returns WaitResult { completed_at, state }.
 
     If state == Timeout: RTSTimeout. Fatal. SDK crashes the process.
     If state == Overrun: RTSOverrun. SDK surfaces it; handling is caller-decided.
 
 wait_timer.touch(ms)                    extend TTL
+wait_timer.free(&mut self)              stops the touch thread, then frees the
+                                         interlock (see Termination, below)
 ```
 
 ### Fatal timeout
@@ -136,13 +166,19 @@ futex times out at 2*W and the daemon has not stamped closed_count, the daemon i
 SDK raises RTSTimeout and crashes the process. Higher-level code never sees it: the blocking
 wait is the liveness check.
 
+The SENTINEL check runs first: if expiration_ns == SENTINEL (the interlock was reaped or
+freed), wait_ms returns InterlockReaped rather than aborting. The abort path fires only when
+the interlock is still nominally live (expiration_ns is a real, still-future value) but the
+daemon simply failed to deliver within the deadline.
+
 </wait-timer-api>
 
 <clock-api>
 
 ## Clock
 
-The daemon-owned system clock interlock. Attached by name "clock". Read-only.
+The daemon-owned system clock interlock. Attached by name "clock". Read-only. No free():
+the system clock is daemon-owned and never terminated by clients.
 
 ```
 client.clock() -> &ClockHandle
@@ -155,6 +191,11 @@ clock.uptime_ms() -> i64                     open_count - closed_count
 clock.wait_open(target) -> Result<u64>       wait for clock to reach monotonic target
 clock.wait_close(target) -> Result<u64>      wait for closed_count >= target
 ```
+
+clock.wait_open and clock.wait_close follow the same SENTINEL rule as Interlock's
+wait_open/wait_close: the loaded word is checked against SENTINEL before it is compared to
+target, and expiration_ns is re-checked against SENTINEL (or an already-past expiration)
+after every futex wake. Either condition returns InterlockReaped.
 
 The clock carries monotonic time:
 
@@ -176,11 +217,17 @@ The SDK spawns a background thread per interlock that calls touch() at a fixed i
 without the owner explicitly touching.
 
 ```
-interlock.start_touch_thread(interval_ms) -> TouchThread
+interlock.start_touch_thread(interval_ms) -> &TouchThread
 touch_thread.stop()
-
-On drop: the thread stops, the heartbeat lapses, the daemon reaps.
+interlock.stop_touch_thread(&mut self)
 ```
+
+stop_touch_thread() drops the current touch thread without terminating the interlock
+itself: the interlock stays live until its TTL is next allowed to lapse, or until free() is
+called explicitly. It is available on Interlock.
+
+On drop: the thread stops, the heartbeat lapses, the daemon reaps. See Termination, below,
+for how this differs from calling free().
 
 </background-touch>
 
@@ -204,6 +251,12 @@ cron.wait() -> WaitResult
     Blocks until the next grid line. Returns completed_at.
     On return, the daemon has already re-armed for the next firing.
     Call wait() again immediately to sleep until the next grid line.
+    Reaped detection checks closed_count == SENTINEL directly, and separately
+    checks expiration_ns == SENTINEL (or an already-past expiration) after each
+    futex wake. Either condition returns InterlockReaped.
+
+cron.free(&mut self)                    stops the touch thread, then frees the
+                                         interlock (see Termination, below)
 ```
 
 Use case: six capture workers on isolated cores, each running a WaitCron at 33ms intervals.
@@ -228,6 +281,12 @@ client.create_wait_barrier(name, conditions) -> WaitBarrier
 barrier.wait() -> WaitResult
     Blocks until ALL conditions are met.
     closed_count is stamped to clock.open_count when the barrier fires.
+    Reaped detection checks expiration_ns, closed_count, and open_count against
+    SENTINEL: once before entering the futex wait, and again (expiration_ns only)
+    after each wake.
+
+barrier.free(&mut self)                 stops the touch thread, then frees the
+                                         interlock (see Termination, below)
 ```
 
 Use case: six cameras, each with an interlock tracking capture cycles. WaitBarrier on all six
@@ -285,6 +344,16 @@ race.wait() -> (usize, WaitResult)
     wait(). Returns when any counter's closed_count advances from its snapshot.
 ```
 
+No free(): WaitRace is an SDK-only composition, not an interlock type. It owns its
+WaitCounters and polls their closed_count on a 1ms sleep loop; it has no touch thread of
+its own.
+
+Pre-existing limitation: race.wait() returns (usize, WaitResult), not a Result, so if a
+polled counter's closed_count reads as SENTINEL (that counter has been reaped or freed
+out from under the race), WaitRace has no way to surface it as an error. A SENTINEL value
+is greater than the counter's initial snapshot like any other advance, so the race reports
+it as a normal win rather than raising InterlockReaped.
+
 Use case: time to first camera ready.
 
 ### WaitUntil
@@ -308,6 +377,8 @@ client.create_process_clock(name) -> ProcessClock
 
 clock.uptime_ms() -> i64           open_count - closed_count
 clock.last_seen_ms() -> u64        open_count (last touch time)
+process_clock.free(&mut self)      stops the touch thread, then frees the
+                                    interlock (see Termination, below)
 ```
 
 Other processes attach read-only. A WaitCounter watching a ProcessClock's open_count fires
@@ -316,7 +387,39 @@ at a specific uptime threshold ("this process has been running for 60 minutes").
 Multiple named process clocks are natural: "clock_pod1_capture", "clock_pod2_inference".
 The daemon sees them as ordinary interlocks. The semantics are SDK-side.
 
-</composition>
+</sdk-compositions>
+
+<termination>
+
+## Termination
+
+Every SDK type that owns a background touch thread exposes free(), and Interlock also
+exposes stop_touch_thread() (stop the thread without terminating the interlock, see
+Background touch, above). free() is an explicit, client-initiated termination: it writes
+the same SENTINEL (u64::MAX) value the daemon writes on reap, so waiters see it
+immediately rather than waiting out a TTL.
+
+| Type | Method | What it does |
+|------|--------|---------------|
+| Interlock | free(&mut self) | stops the touch thread, then calls interlock_free (sets expiration_ns to SENTINEL, wakes waiters) |
+| AttachedInterlock | free(&self) | writes SENTINEL to open_count, wakes waiters on open_count and closed_count. No write access to expiration_ns (attacher has expiration r/o), so it signals through the counters instead of through interlock_free |
+| WaitCounter | free(&mut self) | stops the touch thread, then calls interlock_free |
+| WaitTimer | free(&mut self) | stops the touch thread, then calls interlock_free |
+| WaitCron | free(&mut self) | stops the touch thread, then calls interlock_free |
+| WaitBarrier | free(&mut self) | stops the touch thread, then calls interlock_free |
+| ProcessClock | free(&mut self) | stops the touch thread, then calls interlock_free |
+| AttachedWaitCounter | none | read-only: no write access to any word, so no free() |
+| ClockHandle | none | the system clock is daemon-owned, never terminated by a client |
+| WaitRace | none | SDK-only composition, no touch thread of its own (see WaitRace, above) |
+
+free() versus drop: dropping any of Interlock, WaitCounter, WaitTimer, WaitCron,
+WaitBarrier, or ProcessClock only stops its touch thread; it does not call
+interlock_free. The heartbeat simply lapses and the daemon reaps the interlock on TTL
+expiry, exactly as the Background touch section describes for an ordinary drop. free() is
+the immediate, explicit path: it writes SENTINEL itself and wakes waiters synchronously,
+instead of waiting for the daemon's next TTL-driven reap cycle.
+
+</termination>
 
 <error-summary>
 
@@ -324,7 +427,7 @@ The daemon sees them as ordinary interlocks. The semantics are SDK-side.
 
 | Error | Source | Fatal | When |
 |-------|--------|-------|------|
-| InterlockReaped | daemon (reap) | no | TTL lapsed or name claimed |
+| InterlockReaped | daemon (TTL reap) or client (free()) | no | TTL lapsed, name claimed, or a word read as SENTINEL (u64::MAX), the terminal marker written by both a daemon reap and a client free() |
 | RTSTimeout | SDK (futex timeout) | yes (WaitTimer), no (other) | daemon did not deliver within 2*W |
 | RTSOverrun | SDK (value < 0) | no | daemon delivered late (watched value overshot target) |
 

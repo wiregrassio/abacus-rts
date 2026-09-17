@@ -11,7 +11,7 @@ the SDK against it. Each test gets a unique socket path for parallel execution.
 | File | Purpose |
 |------|---------|
 | `src/lib.rs` | Test harness: start_daemon, test_socket_path, wait_for_socket, cleanup. |
-| `tests/integration.rs` | Integration tests covering timers, counters, reaping, Wildebeest, clock, ProcessClock, permissions. |
+| `tests/integration.rs` | Integration tests covering timers, counters, reaping, Wildebeest, clock, ProcessClock, permissions, free, attacher-free. |
 </files>
 
 <contracts>

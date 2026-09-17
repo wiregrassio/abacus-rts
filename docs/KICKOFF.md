@@ -107,11 +107,13 @@ decides how to handle it.
 
 ## Wildebeest Mode: self-reaping, no detach
 
-There is no drop, no invalidate, no explicit detach. Stop using an interlock and its heartbeat
-lapses and Abacus reaps it. Abacus never faults and never asks why; it reaps and moves on. Create
-a named interlock that already exists and the previous one is reaped and you take over. So a
-process that restarts before the reap interval just recreates its interlock and resumes, and
-nobody is told anything.
+The only exit is death: a lapsed TTL, or writing SENTINEL yourself. Stop using an interlock and
+its heartbeat lapses and Abacus reaps it. Or call `free()`, which writes SENTINEL to the interlock
+and walks away: no detach protocol, no negotiation, no acknowledgment, the daemon sees it on the
+next cycle and cleans up like any other reap. Voluntary or accidental, it is the same mechanism.
+Abacus never faults and never asks why; it reaps and moves on. Create a named interlock that
+already exists and the previous one is reaped and you take over. So a process that restarts before
+the reap interval just recreates its interlock and resumes, and nobody is told anything.
 
 The one error a consumer sees from this: `InterlockReaped`. Go to wait on a counter whose backing
 interlock was reaped, because your own TTL lapsed or someone claimed your name, and you get

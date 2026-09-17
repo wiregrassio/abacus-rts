@@ -8,7 +8,9 @@ state machine; the SDK interprets the results.
 
 ## The state machine
 
-Two stored counters and a TTL produce four derived states.
+Two stored counters and a TTL produce four derived states. Expired has two independent
+triggers: ttl lapse (heartbeat missed) or SENTINEL termination (any word already at the
+terminal marker). interlock_state checks SENTINEL before it checks ttl.
 
 ### Stored properties
 
@@ -18,12 +20,18 @@ Two stored counters and a TTL produce four derived states.
 | word 1 | u64 | closed_count | owner (interlock), daemon (wait types) |
 | word 2 | u64 | expiration_ns | owner via touch, SDK auto-touch on wait |
 
+SENTINEL (u64::MAX) is the terminal marker. Any word holding SENTINEL means the interlock is
+terminated, independent of ttl. interlock_reap stamps all three words to SENTINEL; a bare
+interlock_free stamps expiration_ns alone. Either way, a single word at SENTINEL is enough for
+interlock_state, futex waiters, and interlock_arm to treat the interlock as gone.
+
 ### Derived properties
 
 | Name | Formula | Meaning |
 |------|---------|---------|
 | value | open_count - closed_count (signed) | positive = open, zero = closed, negative = overrun |
 | ttl | expiration_ns - clock_ns (signed) | positive = alive, zero or negative = expired |
+| terminated | any word == SENTINEL (u64::MAX) | true once reaped or freed; short-circuits derivation straight to Expired |
 
 ### States
 
@@ -37,11 +45,11 @@ stateDiagram-v2
     Overrun --> Open : open_count incremented past closed_count (value > 0)
     Overrun --> Closed : open_count catches up to closed_count (value == 0)
 
-    Closed --> Expired : ttl <= 0
-    Open --> Expired : ttl <= 0
-    Overrun --> Expired : ttl <= 0
+    Closed --> Expired : ttl <= 0, or any word == SENTINEL
+    Open --> Expired : ttl <= 0, or any word == SENTINEL
+    Overrun --> Expired : ttl <= 0, or any word == SENTINEL
 
-    Expired --> [*] : daemon reaps
+    Expired --> [*] : daemon reaps (stamps all three words to SENTINEL)
 
     note right of Closed
         value == 0
@@ -61,23 +69,46 @@ stateDiagram-v2
     end note
 
     note right of Expired
-        ttl <= 0
-        heartbeat lapsed
+        ttl <= 0 (heartbeat lapsed)
+        or any word == SENTINEL (already terminated)
         only state the daemon reaps on
     end note
 ```
 
 | State | Condition | Daemon action |
 |-------|-----------|---------------|
-| InterlockState::Closed | value == 0, ttl > 0 | none |
-| InterlockState::Open | value > 0, ttl > 0 | evaluate wait contract if type is WaitCounter, WaitTimer, WaitCron, or WaitBarrier |
-| InterlockState::Overrun | value < 0, ttl > 0 | none (informational; SDK interprets severity) |
-| InterlockState::Expired | ttl <= 0 | reap (write terminal marker, remove from registry) |
+| InterlockState::Closed | value == 0, ttl > 0, no word == SENTINEL | none |
+| InterlockState::Open | value > 0, ttl > 0, no word == SENTINEL | evaluate wait contract if type is WaitCounter, WaitTimer, WaitCron, or WaitBarrier |
+| InterlockState::Overrun | value < 0, ttl > 0, no word == SENTINEL | none (informational; SDK interprets severity) |
+| InterlockState::Expired | any word == SENTINEL, or ttl <= 0 | reap (stamp all three words to SENTINEL, remove from registry) |
 
 Overrun is a flag, not a daemon-fatal condition. The daemon does not reap on overrun. The SDK
 reads value after wake and determines severity: within grace tolerance, or an error to surface.
 For bare interlocks, overrun indicates an owner bug. For wait types, overrun indicates the
 daemon was late (the watched value overshot the target).
+
+### Evaluation order
+
+interlock_state (abacus-client/src/types.rs) checks in this order, given the three loaded
+words and the current clock:
+
+```
+if open == SENTINEL or closed == SENTINEL or expiration_ns == SENTINEL:
+    return Expired
+
+if clock_ns >= expiration_ns:
+    return Expired
+
+value = open - closed
+if value < 0:  return Overrun
+if value > 0:  return Open
+else:          return Closed
+```
+
+SENTINEL is checked first because a terminated interlock's expiration_ns is itself SENTINEL,
+which would otherwise satisfy `clock_ns >= expiration_ns` by coincidence rather than by design.
+Checking SENTINEL explicitly, ahead of the ttl comparison, makes the termination path
+unambiguous regardless of what clock_ns happens to be.
 
 </the-state-machine>
 
@@ -86,18 +117,31 @@ daemon was late (the watched value overshot the target).
 ## Daemon evaluation (every 1 ms cycle)
 
 For every interlock in the registry, the daemon derives state and acts. One pass, not separate
-reap and wake sweeps.
+reap and wake sweeps. The daemon loads all three words once per interlock and reuses that load
+for the SENTINEL check, the TTL check, and the value computation; it never re-reads a word
+within a cycle.
 
 ```
-for each interlock:
-    ttl = expiration_ns - clock_ns
+for each interlock (excluding "clock"):
+    open_count, closed_count, expiration_ns = load all three words once (Acquire)
 
-    if ttl <= 0:                         -> reap
+    if open_count == SENTINEL or closed_count == SENTINEL or expiration_ns == SENTINEL:
+        -> reap (already terminated), remove from registry, next interlock
+
+    if expiration_ns <= clock_ns (ttl <= 0):
+        -> reap (stamp all three words to SENTINEL), remove from registry, next interlock
+
+    value = open_count - closed_count
+    if value <= 0:
+        -> skip (Closed or Overrun)
     else:
-        value = open_count - closed_count
-        if value > 0 AND type != None:   -> evaluate wait contract
-        else:                            -> skip (Closed, Overrun, or bare Open)
+        -> evaluate wait contract if type is WaitCounter, WaitTimer, WaitCron, or WaitBarrier
 ```
+
+The SENTINEL check runs first: an interlock already carrying a SENTINEL word (freed by its
+owner, or reaped on a prior cycle and not yet removed) is reaped and dropped from the registry
+without a TTL comparison. Only after that does the daemon fall through to the TTL check, and
+only after both checks pass does it compute value and evaluate the wait contract.
 
 ### Wait contract evaluation
 
@@ -173,7 +217,10 @@ The "clock" name is reserved; client create("clock") is rejected.
 
 ## Type composition
 
-One primitive, three types, strict superset hierarchy:
+One primitive, three types, strict superset hierarchy. All three inherit the same termination
+mechanism from the base interlock: reap stamps SENTINEL on all three words, and any word at
+SENTINEL means terminated, regardless of type. WaitCounter and WaitTimer add a watch contract
+on top; they do not change how termination is recognized or applied.
 
 ```
 Interlock (type None)
@@ -267,11 +314,13 @@ The daemon produces signals. The SDK interprets them per type:
 |--------|-----------------|-------------|-----------|
 | Closed (value == 0) | idle | normal wake (completed_at == wait_until) | normal wake |
 | Overrun (value < 0) | error (owner bug) | late wake (completed_at > wait_until) | RTSOverrun |
-| Expired (ttl <= 0) | InterlockReaped | InterlockReaped | InterlockReaped |
+| Expired (ttl <= 0, or any word == SENTINEL) | InterlockReaped | InterlockReaped | InterlockReaped |
 | Futex timeout (no daemon wake) | owner's decision | owner's decision | RTSTimeout (fatal) |
 
-RTSTimeout is SDK-only: the daemon never produces it. The futex_wait times out (2 * W for
-timers), the SDK checks value, open still exceeds closed, the daemon never delivered. The SDK
-crashes the process.
+A futex waiter blocked on open_count or closed_count also wakes directly the moment reap
+stamps that word to SENTINEL; it does not have to wait for the next daemon cycle to observe
+expiration_ns. RTSTimeout is SDK-only: the daemon never produces it. The futex_wait times out
+(2 * W for timers), the SDK checks value, open still exceeds closed, the daemon never
+delivered. The SDK crashes the process.
 
 </sdk-state-interpretation>

@@ -13,14 +13,15 @@ and error vocabulary. Both the daemon and the SDK depend on this crate. Depends 
 | `lib.rs` | Module declarations: clock, error, interlock. |
 | `clock.rs` | monotonic_now_nanos, expiration_alive, futex_wake, futex_wait, futex_word, sleep_until_nanos. |
 | `error.rs` | Condition (InterlockReaped, InterlockNotFound, AllocationFailed, InvalidRequest), TransportError, ProtocolFault, StartupError. |
-| `interlock.rs` | Interlock layout (3 x AtomicU64: open_count, closed_count, expiration_ns, 24 bytes), InterlockHandle (Arc-counted RAII munmap), create/open/arm/reap/dup. |
+| `interlock.rs` | Interlock layout (3 x AtomicU64: open_count, closed_count, expiration_ns, 24 bytes), SENTINEL constant (terminal marker), InterlockHandle (Arc-counted RAII munmap), create/open/arm/reap/free/dup, interlock_is_terminated. |
 </files>
 
 <contracts>
 ## Contracts
 
 - The Interlock struct is repr(C), 24 bytes, three u64 words at offsets 0/8/16.
-- interlock_arm uses CAS-max: never decrements expiration. Returns InterlockReaped on terminal zero.
+- SENTINEL = u64::MAX is the terminal marker. Any word at SENTINEL means terminated.
+- interlock_arm uses CAS-max: never decrements expiration. Returns InterlockReaped when expiration_ns == SENTINEL.
 - futex_wait/futex_wake operate on the low 32 bits of a u64 word (Linux kernel constraint).
 - monotonic_now_nanos aborts on clock failure (unrecoverable).
 </contracts>
@@ -46,5 +47,5 @@ and error vocabulary. Both the daemon and the SDK depend on this crate. Depends 
 
 - **In:** memfd_create allocates a 24-byte mapping; interlock_create returns an InterlockHandle wrapping the mapped region.
 - **Through:** Atomic loads/stores on the three u64 words (open_count, closed_count, expiration_ns) by daemon and client processes sharing the fd.
-- **Out:** futex_wake broadcasts counter changes to waiters; interlock_arm CAS-maxes expiration_ns for keepalive.
+- **Out:** futex_wake broadcasts counter changes to waiters; interlock_arm CAS-maxes expiration_ns for keepalive; interlock_free sets expiration_ns to SENTINEL for voluntary termination; interlock_reap sets all three words to SENTINEL.
 </data-flow>

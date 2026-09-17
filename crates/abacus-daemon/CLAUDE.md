@@ -23,6 +23,7 @@ clock. Persistent UDS connections with SCM_RIGHTS fd passing.
 ## Contracts
 
 - The daemon evaluates every interlock every 1ms cycle (best-effort).
+- Daemon checks SENTINEL on any word before TTL. If any word is SENTINEL, reap and remove.
 - Reap only on expired TTL. Overrun is informational, not daemon-fatal.
 - The "clock" name is reserved. create("clock") is rejected.
 - One fd per response. The clock is attached separately by name.
@@ -50,6 +51,6 @@ clock. Persistent UDS connections with SCM_RIGHTS fd passing.
 ## Data Flow
 
 - **In:** UDS connections arrive via non-blocking accept. Framed binary requests (Create, Attach) decoded from each connection.
-- **Through:** Registry maps names to interlock entries with tier metadata. Each 1ms cycle: advance the clock interlock, evaluate_all (single pass: reap expired, stamp and wake watched interlocks whose conditions are met).
+- **Through:** Registry maps names to interlock entries with tier metadata. Each 1ms cycle: advance the clock interlock, evaluate_all (single pass, loads all three words once and reuses them: checks SENTINEL on any word first, reaps and removes on a hit, otherwise checks TTL and stamps/wakes watched interlocks whose conditions are met).
 - **Out:** Created/Attached responses with SCM_RIGHTS fd passing back to clients. Futex wakes on interlock words for cross-process signaling.
 </data-flow>

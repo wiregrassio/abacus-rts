@@ -65,11 +65,18 @@ Three u64 words in a memfd, 24 bytes:
 
 | Word | Offset | Name | Futex-waitable | Semantics |
 |------|--------|------|----------------|-----------|
-| 0 | 0 | open_count | yes | monotonic, non-negative, arbitrary increment |
-| 1 | 8 | closed_count | yes | monotonic, non-negative, arbitrary increment |
-| 2 | 16 | expiration_ns | no | CLOCK_MONOTONIC ns. Future = alive, past or zero = reapable |
+| 0 | 0 | open_count | yes | monotonic, non-negative, arbitrary increment (fetch_add) |
+| 1 | 8 | closed_count | yes | monotonic, non-negative, arbitrary increment (fetch_add) |
+| 2 | 16 | expiration_ns | no | CLOCK_MONOTONIC ns. Future = alive, past = reapable |
 
-Never decremented. open_count and closed_count are independent of expiration_ns.
+SENTINEL = u64::MAX. Any word at SENTINEL means the interlock is terminated: reaped by the
+daemon or freed by a client (see Termination). interlock_is_terminated checks all three words
+for SENTINEL and returns true if any of them matches.
+
+Never decremented. open_count and closed_count are independent of expiration_ns. Counter
+increments use plain fetch_add, not saturating_add: no valid counter reaches SENTINEL under
+normal operation, and if one did, the interlock is already terminated by definition, so further
+advancement is moot.
 
 </interlock-shape>
 
@@ -96,10 +103,13 @@ SDK aliases for WaitCounter/WaitTimer: open_count = `wait_until`, closed_count =
 
 | State | Condition | Code |
 |-------|-----------|------|
-| Closed | value == 0, ttl > 0 | InterlockState::Closed |
-| Open | value > 0, ttl > 0 | InterlockState::Open |
-| Overrun | value < 0 | InterlockState::Overrun |
-| Expired | ttl <= 0 | InterlockState::Expired |
+| Closed | not terminated, value == 0, ttl > 0 | InterlockState::Closed |
+| Open | not terminated, value > 0, ttl > 0 | InterlockState::Open |
+| Overrun | not terminated, value < 0 | InterlockState::Overrun |
+| Expired | terminated (any word == SENTINEL), or ttl <= 0 | InterlockState::Expired |
+
+The terminated check runs before the ttl comparison: a terminated interlock reads as Expired
+regardless of what its ttl arithmetic would otherwise say.
 
 </field-semantics>
 
@@ -107,11 +117,13 @@ SDK aliases for WaitCounter/WaitTimer: open_count = `wait_until`, closed_count =
 
 ## Daemon contract (1 ms best-effort loop)
 
-For every interlock, the daemon derives state and acts:
+For every interlock, the daemon first checks all three words for SENTINEL, then derives state
+from value and ttl and acts:
 
 | State | Action |
 |-------|--------|
-| Expired (ttl <= 0) | reap (write terminal marker, remove from registry, wake waiters) |
+| Terminated (any word == SENTINEL) | reap (write SENTINEL to all three words, remove from registry, wake waiters) |
+| Expired (ttl <= 0) | reap (write SENTINEL to all three words, remove from registry, wake waiters) |
 | Overrun (value < 0) | none (informational flag; SDK interprets severity) |
 | Open + type WaitCounter | if watched interlock's selected word >= open_count: set closed_count = watched value, futex_wake(closed_count) |
 | Open + type WaitTimer | if clock.open_count >= open_count: set closed_count = clock.open_count, futex_wake(closed_count) |
@@ -119,10 +131,16 @@ For every interlock, the daemon derives state and acts:
 | Open + type WaitBarrier | if all conditions met: set closed_count = clock.open_count, futex_wake(closed_count) |
 | Closed, or Open + type Interlock | no action |
 
-The daemon reaps only on expired TTL. Overrun is not daemon-fatal; it is an informational
-state the SDK reads and interprets. For wait types, overrun means the daemon was late (the
-watched value overshot the target). For bare interlocks, overrun means closed_count exceeded
-open_count (an owner bug). In both cases the interlock remains live until its TTL expires.
+The SENTINEL check runs ahead of the TTL check and is what picks up an interlock a client has
+already terminated via free(). free() writes SENTINEL to only one word; the daemon observes
+that on its next evaluation pass and finishes cleanup (writes SENTINEL to the remaining words,
+removes the registry entry, wakes any remaining waiters), exactly as it would for a TTL expiry.
+
+The daemon reaps on either condition: an observed SENTINEL word or an expired TTL. Overrun is
+not daemon-fatal; it is an informational state the SDK reads and interprets. For wait types,
+overrun means the daemon was late (the watched value overshot the target). For bare interlocks,
+overrun means closed_count exceeded open_count (an owner bug). In both cases the interlock
+remains live until termination.
 
 The clock interlock is advanced by the daemon: open_count = monotonic_now_ms each cycle,
 futex_wake(open_count). closed_count is the daemon start time (set once, never changes). The
@@ -136,7 +154,8 @@ clock is never reaped; its expiration is refreshed every cycle.
 
 - Creation TTL is fixed at 100 ms.
 - TTL is monotonic-forward (CAS-max): touch sets expiration to max(current, now + duration).
-  Never decrements. Touch on a reaped interlock (expiration_ns == 0) returns InterlockReaped.
+  Never decrements. interlock_arm checks expiration_ns == SENTINEL before attempting the CAS:
+  touch on a terminated interlock returns InterlockReaped.
 - WaitTimer wait couples target and TTL: wait_ms(W) sets open_count = clock + W and expiration
   to max(current, now + 2 * W). The 2x margin ensures the interlock cannot be reaped while
   legitimately waiting.
@@ -164,10 +183,14 @@ handling is the owner's decision. For bare Interlock, the owner handles timeouts
 
 | Error | Source | When | Response |
 |-------|--------|------|----------|
-| InterlockReaped | daemon | TTL lapsed or name claimed by another create | recreate and resume, or crash |
+| InterlockReaped | daemon or SDK | TTL lapsed, name claimed by another create (Wildebeest reap), or SENTINEL observed on any word (client free or daemon reap) | recreate and resume, or crash |
 | InterlockNotFound | daemon | attach to a name not in the registry, or WaitCounter watched_name not found | re-check the name |
 | RTSTimeout | SDK | WaitTimer futex timed out at 2*W without daemon wake | fatal, SDK crashes the process |
 | RTSOverrun | SDK | closed_count > open_count after wake | non-fatal, surfaces to caller |
+
+SENTINEL (u64::MAX) on open_count, closed_count, or expiration_ns produces InterlockReaped,
+whether observed by the daemon's per-cycle sweep or by an SDK-side check (interlock_arm,
+interlock_is_terminated, the wait_open/wait_close loops). See Termination.
 
 </errors>
 
@@ -175,20 +198,63 @@ handling is the owner's decision. For bare Interlock, the owner handles timeouts
 
 ## Permission model (SDK-enforced)
 
-| Role | open_count | closed_count | expiration_ns |
-|------|-----------|-------------|---------------|
-| Creator (Interlock) | r/w | r/w | r/w |
-| Creator (WaitCounter/WaitTimer) | r/w | r/o (daemon writes) | r/w |
-| Attacher (Interlock) | r/w | r/w | r/o |
-| Attacher (WaitCounter) | r/o | r/o | r/o |
-| Attacher (clock) | r/o | r/o | r/o |
-| WaitTimer | not attachable | -- | -- |
+| Role | open_count | closed_count | expiration_ns | free() |
+|------|-----------|-------------|---------------|--------|
+| Creator (Interlock) | r/w | r/w | r/w | writes SENTINEL to expiration_ns |
+| Creator (WaitCounter/WaitTimer) | r/w | r/o (daemon writes) | r/w | writes SENTINEL to expiration_ns |
+| Attacher (Interlock) | r/w | r/w | r/o | writes SENTINEL to open_count |
+| Attacher (WaitCounter) | r/o | r/o | r/o | no free(): read-only, cannot terminate |
+| Attacher (clock) | r/o | r/o | r/o | no free(): the clock is never freed |
+| WaitTimer | not attachable | -- | -- | -- |
+
+Any holder with a write handle to at least one word can terminate the interlock through that
+word. Creator types free by writing SENTINEL to expiration_ns, the word they hold r/w on.
+Attachers with counter r/w (AttachedInterlock) free by writing SENTINEL to open_count instead,
+since attachers hold only read-only access to expiration_ns. Read-only attachers
+(AttachedWaitCounter, the clock handle) expose no free() at all: a holder with no write access
+to any word has no way to terminate what it observes.
 
 Known limitation: the Attached wire response carries only the id, not the tier. The SDK
 cannot enforce tier-specific permissions on attach. Full enforcement requires a wire change
 to include the tier in the Attached response.
 
 </permission-model>
+
+<termination>
+
+## Termination
+
+An interlock terminates when any of its three words equals SENTINEL (u64::MAX). Termination is
+irreversible: once one word reads SENTINEL, the interlock is dead regardless of the other two
+words' values. interlock_is_terminated checks open_count, closed_count, and expiration_ns and
+returns true if any one of them matches SENTINEL.
+
+Two functions write SENTINEL, and they mean different things:
+
+- **interlock_reap (daemon-initiated).** The daemon calls this when it observes an expired TTL,
+  or when it observes an interlock already terminated by a client. It writes SENTINEL to all
+  three words (open_count, closed_count, expiration_ns), wakes any futex waiters on open_count
+  and closed_count, and removes the entry from its registry. This is full cleanup.
+
+- **interlock_free (client-initiated).** A holder with a write handle calls free() to terminate
+  an interlock without waiting for TTL to lapse. free() writes SENTINEL to exactly one word,
+  not all three, and wakes waiters on open_count and closed_count; the daemon finishes cleanup
+  (removing the registry entry) on its next evaluation pass once it observes that word. Which
+  word gets SENTINEL depends on what the caller holds r/w on: creator types (Interlock) write
+  it to expiration_ns; AttachedInterlock, which has counter r/w but only read access to
+  expiration_ns, writes it to open_count instead. AttachedWaitCounter and the clock handle are
+  read-only on every word and expose no free().
+
+Because interlock_is_terminated and the daemon's per-cycle check both OR across all three
+words, a client-initiated free() is indistinguishable, from the daemon's next pass onward, from
+a daemon-initiated reap: either way the interlock reads as terminated and gets swept.
+
+Counter words use plain fetch_add for open() and close(), not saturating_add. No valid counter
+reaches SENTINEL in normal operation, and if a counter ever did reach it, the interlock would
+already be terminated by definition (any word at SENTINEL means dead), so there is no valid
+state left for a saturating increment to protect.
+
+</termination>
 
 <wire-abi>
 
@@ -235,13 +301,14 @@ WatchedWord: 0 = open_count, 1 = closed_count.
 | Concern | Owner |
 |---------|-------|
 | create and attach over UDS, returning fds | daemon |
-| derive state (value, ttl) and act (reap, wake) | daemon |
+| derive state (value, ttl, terminated) and act via interlock_reap (SENTINEL check first, then TTL; writes SENTINEL to all three words, removes from registry, wakes waiters) | daemon |
 | the 1 ms loop and the clock interlock | daemon |
 | validate watched_name at WaitCounter/WaitBarrier create | daemon |
 | WaitCron auto-re-arm to next grid line | daemon |
 | WaitBarrier all-conditions check | daemon |
 | attach ergonomics, handle lifetime | SDK |
 | background touch thread (auto-keepalive) | SDK |
+| interlock_free (client-initiated termination: writes SENTINEL to expiration_ns for creator types, to open_count for counter-holding attachers; daemon finishes cleanup on its next pass) | SDK |
 | wait_until / completed_at aliases | SDK |
 | futex_wait with timeout, futex_wake for bare interlocks | SDK |
 | RTSTimeout fatal crash | SDK |
