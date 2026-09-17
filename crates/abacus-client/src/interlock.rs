@@ -149,6 +149,12 @@ impl Interlock {
         self.touch_thread = Some(tt);
         self.touch_thread.as_ref().unwrap()
     }
+
+    /// Stop the background touch thread. The interlock's heartbeat will lapse
+    /// and the daemon will reap it unless manually touched.
+    pub fn stop_touch_thread(&mut self) {
+        self.touch_thread.take();
+    }
 }
 
 impl Drop for Interlock {

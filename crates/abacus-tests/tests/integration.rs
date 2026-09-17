@@ -93,9 +93,10 @@ fn interlock_is_reaped_when_not_touched() {
     let path = start_daemon("heartbeat-reap");
     let mut client = AbacusClient::connect(&path).unwrap();
 
-    // Create an interlock but do NOT start a touch thread.
-    // The creation TTL is 100ms, so it will expire.
-    let il = client.create_interlock("ephemeral").unwrap();
+    // Create an interlock and stop its auto-started touch thread.
+    // Without touches, the creation TTL (100ms) will expire.
+    let mut il = client.create_interlock("ephemeral").unwrap();
+    il.stop_touch_thread();
 
     // Wait for the daemon to reap it (100ms TTL + margin).
     std::thread::sleep(Duration::from_millis(150));

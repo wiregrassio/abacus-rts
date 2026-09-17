@@ -25,6 +25,7 @@ use crate::types::DEFAULT_TOUCH_INTERVAL_MS;
 ///   value        = uptime in milliseconds
 pub struct ProcessClock {
     handle: InterlockHandle,
+    #[allow(dead_code)]
     clock: InterlockHandle,
     touch_thread: Option<ProcessClockTouchThread>,
 }

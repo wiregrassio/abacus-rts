@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const NANOS_PER_MS: u64 = 1_000_000;

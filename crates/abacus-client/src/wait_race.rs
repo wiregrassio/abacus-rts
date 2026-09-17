@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::types::{check_wake_state, WaitResult, WaitState};
+use crate::types::{check_wake_state, WaitResult};
 use crate::wait_counter::WaitCounter;
 
 /// Watches N WaitCounters. Returns the index and result of the first to fire.

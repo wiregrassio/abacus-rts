@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
