@@ -9,6 +9,7 @@ use crate::error::{AllocationStep, Condition, Result};
 
 pub const INTERLOCK_SIZE: usize = 24;
 pub const CREATION_TTL_NANOS: u64 = 100_000_000; // 100 ms
+pub const SENTINEL: u64 = u64::MAX;
 
 // -- Layout --
 
@@ -76,9 +77,7 @@ pub fn interlock_create() -> Result<InterlockHandle> {
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     ftruncate(&fd)?;
     let handle = mmap_interlock(fd)?;
-    // Set initial expiration directly. CAS-max interlock_arm would reject
-    // the zero-initialized expiration as reaped.
-    let deadline = monotonic_now_nanos().saturating_add(CREATION_TTL_NANOS);
+    let deadline = monotonic_now_nanos() + CREATION_TTL_NANOS;
     handle.words().expiration_ns.store(deadline, Ordering::Release);
     Ok(handle)
 }
@@ -89,10 +88,10 @@ pub fn interlock_open(fd: OwnedFd) -> Result<InterlockHandle> {
 
 pub fn interlock_arm(handle: &InterlockHandle, ttl_nanos: u64) -> Result<()> {
     let expiration_ns = &handle.words().expiration_ns;
-    let deadline = monotonic_now_nanos().saturating_add(ttl_nanos);
+    let deadline = monotonic_now_nanos() + ttl_nanos;
     loop {
         let current = expiration_ns.load(Ordering::Acquire);
-        if current == 0 {
+        if current == SENTINEL {
             return Err(Condition::InterlockReaped);
         }
         let target = current.max(deadline);
@@ -113,14 +112,26 @@ pub fn interlock_arm(handle: &InterlockHandle, ttl_nanos: u64) -> Result<()> {
 
 pub fn interlock_reap(handle: &InterlockHandle) {
     let words = handle.words();
-    words.expiration_ns.store(0, Ordering::Release);
+    words.open_count.store(SENTINEL, Ordering::Release);
+    words.closed_count.store(SENTINEL, Ordering::Release);
+    words.expiration_ns.store(SENTINEL, Ordering::Release);
     crate::clock::futex_wake(&words.open_count);
     crate::clock::futex_wake(&words.closed_count);
 }
 
-pub fn interlock_is_reapable(handle: &InterlockHandle) -> bool {
-    let exp = handle.words().expiration_ns.load(Ordering::Acquire);
-    exp == 0 || exp < monotonic_now_nanos()
+pub fn interlock_free(handle: &InterlockHandle) {
+    let words = handle.words();
+    words.expiration_ns.store(SENTINEL, Ordering::Release);
+    crate::clock::futex_wake(&words.open_count);
+    crate::clock::futex_wake(&words.closed_count);
+}
+
+pub fn interlock_is_terminated(handle: &InterlockHandle) -> bool {
+    let words = handle.words();
+    let open = words.open_count.load(Ordering::Acquire);
+    let closed = words.closed_count.load(Ordering::Acquire);
+    let exp = words.expiration_ns.load(Ordering::Acquire);
+    open == SENTINEL || closed == SENTINEL || exp == SENTINEL
 }
 
 pub fn interlock_read_expiration(handle: &InterlockHandle) -> u64 {

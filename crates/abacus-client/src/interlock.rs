@@ -6,7 +6,7 @@
 use std::sync::atomic::Ordering;
 
 use abacus_core::clock::{futex_wait, futex_wake, futex_word, monotonic_now_nanos, ms_to_nanos};
-use abacus_core::interlock::{interlock_arm, InterlockHandle};
+use abacus_core::interlock::{interlock_arm, interlock_free, InterlockHandle, SENTINEL};
 
 use crate::types::{interlock_state, InterlockState, DEFAULT_TIMEOUT_NANOS, DEFAULT_TOUCH_INTERVAL_MS};
 
@@ -29,29 +29,15 @@ impl Interlock {
         }
     }
 
-    /// Atomically add `h` to open_count (saturating) and wake any futex waiters.
-    ///
-    /// Saturation preserves the monotonic-non-negative invariant; wrapping
-    /// fetch_add would decrement. The u64 ceiling is unreachable for any
-    /// defined tier.
     pub fn open(&self, h: u64) {
         let word = &self.handle.words().open_count;
-        let _ = word.fetch_update(Ordering::Release, Ordering::Acquire, |v| {
-            Some(v.saturating_add(h))
-        });
+        word.fetch_add(h, Ordering::Release);
         futex_wake(word);
     }
 
-    /// Atomically add `h` to closed_count (saturating) and wake any futex waiters.
-    ///
-    /// Saturation preserves the monotonic-non-negative invariant; wrapping
-    /// fetch_add would decrement. The u64 ceiling is unreachable for any
-    /// defined tier.
     pub fn close(&self, h: u64) {
         let word = &self.handle.words().closed_count;
-        let _ = word.fetch_update(Ordering::Release, Ordering::Acquire, |v| {
-            Some(v.saturating_add(h))
-        });
+        word.fetch_add(h, Ordering::Release);
         futex_wake(word);
     }
 
@@ -69,53 +55,39 @@ impl Interlock {
         (open, closed)
     }
 
-    /// Futex-wait loop until open_count >= target. Uses DEFAULT_TIMEOUT_NANOS
-    /// per iteration; checks for reaped state on each timeout.
-    ///
-    /// Uses the low 32 bits of the counter for futex comparison (Linux kernel
-    /// constraint). An increment that is an exact multiple of 2^32 landing in
-    /// the load-to-syscall window adds one timeout cycle of latency. No
-    /// realistic increment triggers this.
-    ///
-    /// Returns Err(InterlockReaped) if the interlock is reaped while waiting.
     pub fn wait_open(&self, target: u64) -> Result<u64, SdkError> {
         let word = &self.handle.words().open_count;
         loop {
             let current = word.load(Ordering::Acquire);
+            if current == SENTINEL {
+                return Err(SdkError::InterlockReaped);
+            }
             if current >= target {
                 return Ok(current);
             }
             let lo32 = futex_word(current);
             futex_wait(word, lo32, DEFAULT_TIMEOUT_NANOS);
-            // After timeout or wake: check if the interlock was reaped.
             let exp = self.handle.words().expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
         }
     }
 
-    /// Futex-wait loop until closed_count >= target. Uses DEFAULT_TIMEOUT_NANOS
-    /// per iteration; checks for reaped state on each timeout.
-    ///
-    /// Uses the low 32 bits of the counter for futex comparison (Linux kernel
-    /// constraint). An increment that is an exact multiple of 2^32 landing in
-    /// the load-to-syscall window adds one timeout cycle of latency. No
-    /// realistic increment triggers this.
-    ///
-    /// Returns Err(InterlockReaped) if the interlock is reaped while waiting.
     pub fn wait_close(&self, target: u64) -> Result<u64, SdkError> {
         let word = &self.handle.words().closed_count;
         loop {
             let current = word.load(Ordering::Acquire);
+            if current == SENTINEL {
+                return Err(SdkError::InterlockReaped);
+            }
             if current >= target {
                 return Ok(current);
             }
             let lo32 = futex_word(current);
             futex_wait(word, lo32, DEFAULT_TIMEOUT_NANOS);
-            // After timeout or wake: check if the interlock was reaped.
             let exp = self.handle.words().expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
         }
@@ -155,6 +127,13 @@ impl Interlock {
     pub fn stop_touch_thread(&mut self) {
         self.touch_thread.take();
     }
+
+    /// Terminate this interlock. Stops the touch thread and sets the terminal
+    /// sentinel. The daemon cleans up on its next cycle.
+    pub fn free(&mut self) {
+        self.stop_touch_thread();
+        interlock_free(&self.handle);
+    }
 }
 
 impl Drop for Interlock {
@@ -175,29 +154,15 @@ impl AttachedInterlock {
         Self { handle }
     }
 
-    /// Atomically add `h` to open_count (saturating) and wake any futex waiters.
-    ///
-    /// Saturation preserves the monotonic-non-negative invariant; wrapping
-    /// fetch_add would decrement. The u64 ceiling is unreachable for any
-    /// defined tier.
     pub fn open(&self, h: u64) {
         let word = &self.handle.words().open_count;
-        let _ = word.fetch_update(Ordering::Release, Ordering::Acquire, |v| {
-            Some(v.saturating_add(h))
-        });
+        word.fetch_add(h, Ordering::Release);
         futex_wake(word);
     }
 
-    /// Atomically add `h` to closed_count (saturating) and wake any futex waiters.
-    ///
-    /// Saturation preserves the monotonic-non-negative invariant; wrapping
-    /// fetch_add would decrement. The u64 ceiling is unreachable for any
-    /// defined tier.
     pub fn close(&self, h: u64) {
         let word = &self.handle.words().closed_count;
-        let _ = word.fetch_update(Ordering::Release, Ordering::Acquire, |v| {
-            Some(v.saturating_add(h))
-        });
+        word.fetch_add(h, Ordering::Release);
         futex_wake(word);
     }
 
@@ -209,67 +174,49 @@ impl AttachedInterlock {
         (open, closed)
     }
 
-    /// Futex-wait loop until open_count >= target. Uses DEFAULT_TIMEOUT_NANOS
-    /// per iteration; checks for reaped state on each timeout.
-    ///
-    /// Uses the low 32 bits of the counter for futex comparison (Linux kernel
-    /// constraint). An increment that is an exact multiple of 2^32 landing in
-    /// the load-to-syscall window adds one timeout cycle of latency. No
-    /// realistic increment triggers this.
-    ///
-    /// Returns Err(InterlockReaped) if the interlock is reaped while waiting.
     pub fn wait_open(&self, target: u64) -> Result<u64, SdkError> {
         let word = &self.handle.words().open_count;
         loop {
             let current = word.load(Ordering::Acquire);
+            if current == SENTINEL {
+                return Err(SdkError::InterlockReaped);
+            }
             if current >= target {
                 return Ok(current);
             }
             let lo32 = futex_word(current);
             futex_wait(word, lo32, DEFAULT_TIMEOUT_NANOS);
             let exp = self.handle.words().expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
         }
     }
 
-    /// Futex-wait loop until closed_count >= target. Uses DEFAULT_TIMEOUT_NANOS
-    /// per iteration; checks for reaped state on each timeout.
-    ///
-    /// Uses the low 32 bits of the counter for futex comparison (Linux kernel
-    /// constraint). An increment that is an exact multiple of 2^32 landing in
-    /// the load-to-syscall window adds one timeout cycle of latency. No
-    /// realistic increment triggers this.
-    ///
-    /// Returns Err(InterlockReaped) if the interlock is reaped while waiting.
     pub fn wait_close(&self, target: u64) -> Result<u64, SdkError> {
         let word = &self.handle.words().closed_count;
         loop {
             let current = word.load(Ordering::Acquire);
+            if current == SENTINEL {
+                return Err(SdkError::InterlockReaped);
+            }
             if current >= target {
                 return Ok(current);
             }
             let lo32 = futex_word(current);
             futex_wait(word, lo32, DEFAULT_TIMEOUT_NANOS);
             let exp = self.handle.words().expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
         }
     }
 
-    /// Signed difference: open_count - closed_count.
-    ///
-    /// Wrapping i64 subtraction. Counters above i64::MAX (2^63) are outside the
-    /// spec's representable range. No defined tier reaches this.
     pub fn value(&self) -> i64 {
         let (open, closed) = self.peek();
         (open as i64).wrapping_sub(closed as i64)
     }
 
-    /// Derive the lifecycle state (Open, Closed, Overrun, Expired) from the
-    /// current counter values and expiration. Uses CLOCK_MONOTONIC internally.
     pub fn state(&self) -> InterlockState {
         let words = self.handle.words();
         let open = words.open_count.load(Ordering::Acquire);
@@ -277,6 +224,15 @@ impl AttachedInterlock {
         let expiration_ns = words.expiration_ns.load(Ordering::Acquire);
         let clock_ns = monotonic_now_nanos();
         interlock_state(open, closed, expiration_ns, clock_ns)
+    }
+
+    /// Terminate this interlock by writing SENTINEL to open_count. Attachers
+    /// have r/o on expiration, so they terminate via a counter.
+    pub fn free(&self) {
+        let word = &self.handle.words().open_count;
+        word.store(SENTINEL, Ordering::Release);
+        futex_wake(word);
+        futex_wake(&self.handle.words().closed_count);
     }
 }
 
@@ -363,51 +319,39 @@ impl ClockHandle {
         self.value()
     }
 
-    /// Futex-wait loop until open_count >= target. The clock's open_count is
-    /// the advancing monotonic time in ms; this waits for the clock to reach a
-    /// specific timestamp. Uses DEFAULT_TIMEOUT_NANOS per iteration with
-    /// reaped check.
-    ///
-    /// Uses the low 32 bits of the counter for futex comparison (Linux kernel
-    /// constraint). An increment that is an exact multiple of 2^32 landing in
-    /// the load-to-syscall window adds one timeout cycle of latency. No
-    /// realistic increment triggers this.
     pub fn wait_open(&self, target: u64) -> Result<u64, SdkError> {
         let word = &self.handle.words().open_count;
         loop {
             let current = word.load(Ordering::Acquire);
+            if current == SENTINEL {
+                return Err(SdkError::InterlockReaped);
+            }
             if current >= target {
                 return Ok(current);
             }
             let lo32 = futex_word(current);
             futex_wait(word, lo32, DEFAULT_TIMEOUT_NANOS);
             let exp = self.handle.words().expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
         }
     }
 
-    /// Futex-wait loop until closed_count >= target. The clock's closed_count
-    /// is the daemon start time (fixed), so this is primarily useful for
-    /// confirming the daemon is alive. Uses DEFAULT_TIMEOUT_NANOS per iteration
-    /// with reaped check.
-    ///
-    /// Uses the low 32 bits of the counter for futex comparison (Linux kernel
-    /// constraint). An increment that is an exact multiple of 2^32 landing in
-    /// the load-to-syscall window adds one timeout cycle of latency. No
-    /// realistic increment triggers this.
     pub fn wait_close(&self, target: u64) -> Result<u64, SdkError> {
         let word = &self.handle.words().closed_count;
         loop {
             let current = word.load(Ordering::Acquire);
+            if current == SENTINEL {
+                return Err(SdkError::InterlockReaped);
+            }
             if current >= target {
                 return Ok(current);
             }
             let lo32 = futex_word(current);
             futex_wait(word, lo32, DEFAULT_TIMEOUT_NANOS);
             let exp = self.handle.words().expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
         }

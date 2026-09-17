@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use abacus_core::clock::ms_to_nanos;
-use abacus_core::interlock::{interlock_arm, InterlockHandle};
+use abacus_core::interlock::{interlock_arm, interlock_free, InterlockHandle};
 
 use crate::types::DEFAULT_TOUCH_INTERVAL_MS;
 
@@ -77,6 +77,11 @@ impl ProcessClock {
         self.touch_thread
             .as_ref()
             .map_or(true, |tt| tt.is_reaped())
+    }
+
+    pub fn free(&mut self) {
+        self.touch_thread.take();
+        interlock_free(&self.handle);
     }
 }
 

@@ -49,15 +49,12 @@ pub enum InterlockState {
     Expired,
 }
 
-/// Compute the interlock lifecycle state from raw field values.
-///
-/// `open` and `closed` are the counter values. `expiration_ns` is the
-/// interlock's expiration in CLOCK_MONOTONIC nanoseconds. `clock_ns` is the
-/// current CLOCK_MONOTONIC time in nanoseconds.
 pub fn interlock_state(open: u64, closed: u64, expiration_ns: u64, clock_ns: u64) -> InterlockState {
-    // Expired takes priority: if TTL has lapsed, the interlock is dead
-    // regardless of counter state.
-    if expiration_ns == 0 || clock_ns >= expiration_ns {
+    use abacus_core::interlock::SENTINEL;
+    if open == SENTINEL || closed == SENTINEL || expiration_ns == SENTINEL {
+        return InterlockState::Expired;
+    }
+    if clock_ns >= expiration_ns {
         return InterlockState::Expired;
     }
     let value = (open as i64).wrapping_sub(closed as i64);

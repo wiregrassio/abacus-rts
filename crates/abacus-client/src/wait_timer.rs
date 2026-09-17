@@ -4,7 +4,7 @@
 use std::sync::atomic::Ordering;
 
 use abacus_core::clock::{futex_wait, futex_word, monotonic_now_nanos, ms_to_nanos};
-use abacus_core::interlock::{interlock_arm, InterlockHandle};
+use abacus_core::interlock::{interlock_arm, interlock_free, InterlockHandle, SENTINEL};
 
 use crate::client::SdkError;
 use crate::touch::TouchThread;
@@ -50,7 +50,7 @@ impl WaitTimer {
 
         // 2. CAS-max: never writes open_count backward. Concurrent wait_ms calls
         // with different durations preserve the largest target.
-        let target = clock_now.saturating_add(ms);
+        let target = clock_now + ms;
         loop {
             let current = words.open_count.load(Ordering::Acquire);
             if target <= current {
@@ -90,9 +90,8 @@ impl WaitTimer {
                     });
                 }
                 WaitState::Timeout => {
-                    // Check if the interlock was reaped while waiting.
                     let exp = self.handle.words().expiration_ns.load(Ordering::Acquire);
-                    if exp == 0 {
+                    if exp == SENTINEL {
                         return Err(SdkError::InterlockReaped);
                     }
                     // Compute remaining budget from absolute deadline.
@@ -157,6 +156,11 @@ impl WaitTimer {
         let open = words.open_count.load(Ordering::Acquire);
         let closed = words.closed_count.load(Ordering::Acquire);
         (open, closed)
+    }
+
+    pub fn free(&mut self) {
+        self.touch_thread.take();
+        interlock_free(&self.handle);
     }
 }
 

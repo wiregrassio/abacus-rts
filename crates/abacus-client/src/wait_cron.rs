@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 
 use abacus_core::clock::{futex_wait, futex_word, monotonic_now_nanos};
-use abacus_core::interlock::InterlockHandle;
+use abacus_core::interlock::{interlock_free, InterlockHandle, SENTINEL};
 
 use crate::client::SdkError;
 use crate::touch::TouchThread;
@@ -48,6 +48,9 @@ impl WaitCron {
 
         loop {
             let closed = closed_word.load(Ordering::Acquire);
+            if closed == SENTINEL {
+                return Err(SdkError::InterlockReaped);
+            }
             if closed > initial_closed {
                 // Daemon fired and stamped a new closed_count.
                 let open = words.open_count.load(Ordering::Acquire);
@@ -70,9 +73,8 @@ impl WaitCron {
                 });
             }
 
-            // Check reaped.
             let exp = words.expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
 
@@ -93,6 +95,11 @@ impl WaitCron {
         let open = words.open_count.load(Ordering::Acquire);
         let closed = words.closed_count.load(Ordering::Acquire);
         (open, closed)
+    }
+
+    pub fn free(&mut self) {
+        self.touch_thread.take();
+        interlock_free(&self.handle);
     }
 }
 

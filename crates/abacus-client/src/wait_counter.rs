@@ -4,7 +4,7 @@
 use std::sync::atomic::Ordering;
 
 use abacus_core::clock::{futex_wait, futex_word, ms_to_nanos};
-use abacus_core::interlock::{interlock_arm, InterlockHandle};
+use abacus_core::interlock::{interlock_arm, interlock_free, InterlockHandle, SENTINEL};
 
 use crate::client::SdkError;
 use crate::touch::TouchThread;
@@ -96,9 +96,8 @@ impl WaitCounter {
                             });
                         }
                         WaitState::Timeout => {
-                            // Check if the interlock was reaped while waiting.
                             let exp = words.expiration_ns.load(Ordering::Acquire);
-                            if exp == 0 {
+                            if exp == SENTINEL {
                                 return Err(SdkError::InterlockReaped);
                             }
                             // Check if the futex actually timed out (ret == -1 with ETIMEDOUT).
@@ -148,6 +147,11 @@ impl WaitCounter {
     pub fn value(&self) -> i64 {
         let (open, closed) = self.peek();
         (open as i64).wrapping_sub(closed as i64)
+    }
+
+    pub fn free(&mut self) {
+        self.touch_thread.take();
+        interlock_free(&self.handle);
     }
 }
 

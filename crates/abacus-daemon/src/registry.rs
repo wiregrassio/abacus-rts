@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering;
 use abacus_core::clock::{futex_wake, expiration_alive, monotonic_now_nanos};
 use abacus_core::error::{Condition, Result};
 use abacus_core::interlock::{
-    interlock_arm, interlock_create, interlock_dup_fd, interlock_read_expiration, interlock_reap,
-    InterlockHandle,
+    interlock_arm, interlock_create, interlock_dup_fd, interlock_reap,
+    InterlockHandle, SENTINEL,
 };
 
 // -- Tier --
@@ -241,10 +241,11 @@ impl Registry {
     }
 
     /// Evaluate all interlocks in a single pass. For each (excluding "clock"):
-    ///   1. TTL check: if expired, mark for removal and reap.
-    ///   2. Compute value = open_count - closed_count.
-    ///   3. If Open and wait type, evaluate the wait contract and wake if met.
-    /// After iteration, remove expired entries from the map.
+    ///   1. Sentinel check: if any word is SENTINEL, clean up.
+    ///   2. TTL check: if expired, reap.
+    ///   3. Compute value = open_count - closed_count.
+    ///   4. If Open and wait type, evaluate the wait contract and wake if met.
+    /// After iteration, remove dead entries from the map.
     pub fn evaluate_all(&mut self, clock_now_ms: u64) {
         let now_ns = monotonic_now_nanos();
 
@@ -255,18 +256,25 @@ impl Registry {
                 continue;
             }
 
-            // TTL check.
-            let exp = interlock_read_expiration(&entry.handle);
+            let words = entry.handle.words();
+            let open_count = words.open_count.load(Ordering::Acquire);
+            let closed_count = words.closed_count.load(Ordering::Acquire);
+            let exp = words.expiration_ns.load(Ordering::Acquire);
+
+            // Terminated: any word at SENTINEL.
+            if open_count == SENTINEL || closed_count == SENTINEL || exp == SENTINEL {
+                interlock_reap(&entry.handle);
+                to_remove.push(name.clone());
+                continue;
+            }
+
+            // TTL expired.
             if !expiration_alive(exp, now_ns) {
                 interlock_reap(&entry.handle);
                 to_remove.push(name.clone());
                 continue;
             }
 
-            // Compute value.
-            let words = entry.handle.words();
-            let open_count = words.open_count.load(Ordering::Acquire);
-            let closed_count = words.closed_count.load(Ordering::Acquire);
             let value = (open_count as i64).wrapping_sub(closed_count as i64);
 
             // Only evaluate wait contract for Open interlocks with a wait type.

@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 
 use abacus_core::clock::{futex_wait, futex_word, monotonic_now_nanos};
-use abacus_core::interlock::InterlockHandle;
+use abacus_core::interlock::{interlock_free, InterlockHandle, SENTINEL};
 
 use crate::client::SdkError;
 use crate::touch::TouchThread;
@@ -57,18 +57,16 @@ impl WaitBarrier {
                 });
             }
 
-            // Not yet delivered. Futex-wait on closed_count.
             let exp = words.expiration_ns.load(Ordering::Acquire);
-            if exp == 0 {
+            if exp == SENTINEL || closed == SENTINEL || open == SENTINEL {
                 return Err(SdkError::InterlockReaped);
             }
 
             let lo32 = futex_word(closed);
             futex_wait(closed_word, lo32, DEFAULT_TIMEOUT_NANOS);
 
-            // Check reaped after wake.
             let exp = words.expiration_ns.load(Ordering::Acquire);
-            if exp == 0 || exp < monotonic_now_nanos() {
+            if exp == SENTINEL || exp < monotonic_now_nanos() {
                 return Err(SdkError::InterlockReaped);
             }
         }
@@ -86,6 +84,11 @@ impl WaitBarrier {
         let open = words.open_count.load(Ordering::Acquire);
         let closed = words.closed_count.load(Ordering::Acquire);
         (open, closed)
+    }
+
+    pub fn free(&mut self) {
+        self.touch_thread.take();
+        interlock_free(&self.handle);
     }
 }
 
